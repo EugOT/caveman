@@ -5,7 +5,7 @@
 <h1 align="center">caveman</h1>
 
 <p align="center">
-  <strong>why use many token when few token do trick</strong>
+  <strong>why use many token when few do trick</strong>
 </p>
 
 <p align="center">
