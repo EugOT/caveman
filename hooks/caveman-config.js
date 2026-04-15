@@ -58,37 +58,29 @@ function getDefaultMode() {
   return 'full';
 }
 
-// Walk every ancestor component of p and refuse if any is a symlink.
-// Protects against a parent-dir symlink redirecting the final write.
-function hasSymlinkInPath(p) {
-  const resolved = path.resolve(p);
-  const parsed = path.parse(resolved);
-  let current = parsed.root;
-  const parts = resolved.slice(parsed.root.length).split(path.sep).filter(Boolean);
-  for (const part of parts) {
-    current = path.join(current, part);
-    try {
-      if (fs.lstatSync(current).isSymbolicLink()) return true;
-    } catch (e) {
-      if (e.code === 'ENOENT') continue;
-      return true;
-    }
-  }
-  return false;
-}
-
 // Symlink-safe flag file write.
-// Refuses symlinks at the target and in any parent component, creates with
-// 0600, uses O_NOFOLLOW where available, writes atomically via temp + rename.
-// Protects against local attackers replacing the predictable flag path
-// (~/.claude/.caveman-active) with a symlink to clobber other files.
+// Refuses symlinks at the target file and at the immediate parent directory,
+// uses O_NOFOLLOW where available, writes atomically via temp + rename with
+// 0600 permissions. Protects against local attackers replacing the predictable
+// flag path (~/.claude/.caveman-active) with a symlink to clobber other files.
+//
+// Does NOT walk the full ancestor chain — macOS has /tmp -> /private/tmp and
+// many legitimate setups route through symlinked home dirs, so a full walk
+// produces false positives. The attack surface requires write access to the
+// immediate parent, which is what we check.
+//
 // Silent-fails on any filesystem error — the flag is best-effort.
 function safeWriteFlag(flagPath, content) {
   try {
     const flagDir = path.dirname(flagPath);
-    if (hasSymlinkInPath(flagDir)) return;
-    fs.mkdirSync(flagDir, { recursive: true, mode: 0o700 });
-    if (hasSymlinkInPath(flagDir)) return;
+    fs.mkdirSync(flagDir, { recursive: true });
+
+    // Refuse if the parent directory itself is a symlink (attacker redirect).
+    try {
+      if (fs.lstatSync(flagDir).isSymbolicLink()) return;
+    } catch (e) {
+      return;
+    }
 
     // Refuse if the target already exists as a symlink.
     try {
