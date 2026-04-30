@@ -35,14 +35,22 @@ process.stdin.on('end', () => {
       }
     }
 
-    // /caveman-stats — block the prompt and inject stats output as the
-    // hook's reason. The script reads the active session log, so we pass
+    // /caveman-stats [--share] — block the prompt and inject stats output as
+    // the hook's reason. The script reads the active session log, so we pass
     // transcript_path through when Claude Code provides it.
-    if (prompt === '/caveman-stats' || prompt === '/caveman:caveman-stats') {
+    const statsMatch = /^\/caveman(?::caveman)?-stats(?:\s+(.*))?$/.exec(prompt);
+    if (statsMatch) {
+      const tailArgs = (statsMatch[1] || '').trim().split(/\s+/).filter(Boolean);
       try {
         const statsPath = path.join(__dirname, 'caveman-stats.js');
         const argv = [statsPath];
         if (data.transcript_path) argv.push('--session-file', data.transcript_path);
+        if (tailArgs.includes('--share')) argv.push('--share');
+        if (tailArgs.includes('--all')) argv.push('--all');
+        const sinceIdx = tailArgs.indexOf('--since');
+        if (sinceIdx !== -1 && tailArgs[sinceIdx + 1]) {
+          argv.push('--since', tailArgs[sinceIdx + 1]);
+        }
         const out = execFileSync(process.execPath, argv, { encoding: 'utf8', timeout: 5000 });
         process.stdout.write(JSON.stringify({ decision: 'block', reason: out.trim() }));
       } catch (e) {

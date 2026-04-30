@@ -189,4 +189,86 @@ function readFlag(flagPath) {
   }
 }
 
-module.exports = { getDefaultMode, getConfigDir, getConfigPath, VALID_MODES, safeWriteFlag, readFlag };
+// Symlink-safe append. Same parent-dir + symlink-target rules as safeWriteFlag,
+// but opens with O_APPEND so concurrent writers from different sessions don't
+// clobber each other. Used for the lifetime stats log
+// ($CLAUDE_CONFIG_DIR/.caveman-history.jsonl).
+//
+// Silent-fails on any filesystem error.
+function appendFlag(filePath, line) {
+  const debug = process.env.CAVEMAN_DEBUG === '1';
+  try {
+    const dir = path.dirname(filePath);
+    fs.mkdirSync(dir, { recursive: true });
+
+    let realDir;
+    try {
+      const lstat = fs.lstatSync(dir);
+      if (lstat.isSymbolicLink()) {
+        realDir = fs.realpathSync(dir);
+        const realStat = fs.statSync(realDir);
+        if (!realStat.isDirectory()) return;
+        if (typeof process.getuid === 'function') {
+          if (realStat.uid !== process.getuid()) {
+            if (debug) process.stderr.write(`[caveman] appendFlag: symlink target ${realDir} owned by uid ${realStat.uid}\n`);
+            return;
+          }
+        } else {
+          const home = os.homedir();
+          const normalized = path.resolve(realDir).toLowerCase();
+          const normalizedHome = path.resolve(home).toLowerCase();
+          if (!normalized.startsWith(normalizedHome + path.sep) && normalized !== normalizedHome) return;
+        }
+      } else {
+        realDir = dir;
+      }
+    } catch (e) {
+      return;
+    }
+
+    const realPath = path.join(realDir, path.basename(filePath));
+    try {
+      if (fs.lstatSync(realPath).isSymbolicLink()) return;
+    } catch (e) {
+      if (e.code !== 'ENOENT') return;
+    }
+
+    const O_NOFOLLOW = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | O_NOFOLLOW;
+    let fd;
+    try {
+      fd = fs.openSync(realPath, flags, 0o600);
+      fs.writeSync(fd, String(line).replace(/\n$/, '') + '\n');
+      try { fs.fchmodSync(fd, 0o600); } catch (e) { /* best-effort on Windows */ }
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+  } catch (e) {
+    // Silent fail — history is best-effort
+  }
+}
+
+// Symlink-safe history read. Returns lines (untrimmed) or empty array on any
+// anomaly. Caller is responsible for parsing JSON. Does NOT enforce a size cap
+// the way readFlag does — history is expected to grow with use.
+function readHistory(filePath) {
+  try {
+    const st = fs.lstatSync(filePath);
+    if (st.isSymbolicLink() || !st.isFile()) return [];
+    const O_NOFOLLOW = typeof fs.constants.O_NOFOLLOW === 'number' ? fs.constants.O_NOFOLLOW : 0;
+    const flags = fs.constants.O_RDONLY | O_NOFOLLOW;
+    let fd;
+    let raw;
+    try {
+      fd = fs.openSync(filePath, flags);
+      raw = fs.readFileSync(fd, 'utf8');
+    } finally {
+      if (fd !== undefined) fs.closeSync(fd);
+    }
+    return raw.split('\n').filter(line => line.trim());
+  } catch (e) {
+    return [];
+  }
+}
+
+module.exports = { getDefaultMode, getConfigDir, getConfigPath, VALID_MODES, safeWriteFlag, readFlag, appendFlag, readHistory };

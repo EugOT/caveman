@@ -129,7 +129,19 @@ Based on the viral observation that caveman-speak dramatically reduces LLM token
 
 ## Install
 
-Pick your agent. One command. Done.
+**One line, every agent on your machine:**
+
+```bash
+# macOS / Linux / WSL / Git Bash
+curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.sh | bash
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.ps1 | iex
+```
+
+Installer detect every agent on machine (Claude Code, Gemini CLI, Codex, Cursor, Windsurf, Cline, Copilot). Run native install for each. Skip what you not have. Safe to re-run. Pass `--only <agent>` for one target, `--dry-run` to preview.
+
+**Or pick your agent manually:**
 
 | Agent | Install |
 |-------|---------|
@@ -160,6 +172,7 @@ Auto-activation is built in for Claude Code, Gemini CLI, and the repo-local Code
 | caveman-compress | Y | Y | Y | Y | Y | Y | Y |
 | caveman-help | Y | — | Y | Y | Y | Y | Y |
 | caveman-stats | Y | — | — | — | — | — | — |
+| cavecrew (subagents) | Y | — | — | — | — | — | — |
 
 > [!NOTE]
 > Auto-activation works differently per agent: Claude Code uses SessionStart hooks, this repo's Codex dogfood setup uses `.codex/hooks.json`, Gemini uses context files. Cursor/Windsurf/Cline/Copilot can be made always-on, but `npx skills add` installs only the skill, not the repo rule/instruction files.
@@ -375,7 +388,7 @@ Level stick until you change it or session end.
 
 ### caveman-stats
 
-`/caveman-stats` — real token usage for current session + estimated savings. Reads the Claude Code session JSONL directly so the numbers are not the model's guess. Savings estimate uses the 65% mean per-task figure from `benchmarks/`; only `full` mode has measured data.
+`/caveman-stats` — real token usage + estimated savings + dollar amount. Reads the Claude Code session JSONL directly so the numbers are not the model's guess. Pricing comes from the model id stamped on each turn; ratio comes from `benchmarks/` (only `full` has measured data so far).
 
 ```
 Caveman Stats
@@ -388,10 +401,57 @@ Cache-read tokens:     128,400
 ──────────────────────────────────
 Est. without caveman:  9,171
 Est. tokens saved:     5,961 (~65%)
-Savings est. from benchmarks/ (mean per-task). Actual varies by task.
+Est. saved (USD):      ~$0.089
+──────────────────────────────────
+Memory compressed:     2 files, ~1,920 tokens saved per session start (approx)
+Savings est. from benchmarks/ (mean per-task). Pricing for claude-sonnet-4-7. Actual varies by task.
 ```
 
+**Lifetime totals** — caveman-stats appends a snapshot to `~/.claude/.caveman-history.jsonl` on every run:
+
+| Command | What |
+|---|---|
+| `/caveman-stats` | This session only |
+| `/caveman-stats --all` | Everything ever recorded (one row per session, latest snapshot wins) |
+| `/caveman-stats --since 7d` | Last 7 days (`Nh` or `Nd`) |
+| `/caveman-stats --share` | One-line tweetable summary 🪨 |
+
+**Statusline savings** — opt-in. Set `CAVEMAN_STATUSLINE_SAVINGS=1` in your shell environment, then your status bar shows `[CAVEMAN] ⛏ 12.4k` (lifetime tokens saved). Updates every time `/caveman-stats` runs.
+
 Claude Code only — needs the hook system to read the session transcript.
+
+### cavecrew
+
+Caveman-flavored subagent presets for Claude Code. Three drop-ins:
+
+- `@cavecrew-investigator` — read-only research. Returns `file:line` references in fragment form. No suggestions.
+- `@cavecrew-builder` — small surgical edits in 1-2 files. Returns a caveman-style diff summary.
+- `@cavecrew-reviewer` — PR review in `L<line>: <severity> <problem>. <fix>.` form. No praise, no scope creep.
+
+When you delegate work to a subagent, agent-to-agent prose is exactly the spot where caveman's grammar earns the most. All three subagents inherit caveman rules at ultra intensity, so handoffs stay terse without you having to remind them every turn.
+
+Claude Code only — subagents are a Claude Code primitive.
+
+### caveman-init (cavepack)
+
+Drop the always-on caveman rule into any repo, for every IDE agent at once. Idempotent.
+
+```bash
+# In your project root:
+node tools/caveman-init.js              # writes rule files for all targets
+node tools/caveman-init.js --dry-run    # preview what would change
+node tools/caveman-init.js --only cline # one target only
+```
+
+Targets installed (skips any that already contain the caveman sentinel):
+
+- `.cursor/rules/caveman.mdc` — Cursor frontmatter (`alwaysApply: true`)
+- `.windsurf/rules/caveman.md` — Windsurf frontmatter (`trigger: always_on`)
+- `.clinerules/caveman.md` — Cline (auto-discovered)
+- `.github/copilot-instructions.md` — Copilot (appended below existing content)
+- `AGENTS.md` — generic agent context (appended)
+
+Existing rule files are left alone unless `--force` is passed; appendable targets (Copilot, AGENTS.md) get the caveman block appended below your existing content. To compress an existing `CLAUDE.md`, use `/caveman:compress` instead — that's a separate, higher-stakes operation.
 
 ### caveman-compress
 
@@ -418,6 +478,28 @@ CLAUDE.original.md ← human-readable backup (you read and edit this)
 | **Average** | **898** | **481** | **46%** |
 
 Code blocks, URLs, file paths, commands, headings, dates, version numbers — anything technical passes through untouched. Only prose gets compressed. See the full [caveman-compress README](caveman-compress/README.md) for details. [Security note](./caveman-compress/SECURITY.md): Snyk flags this as High Risk due to subprocess/file patterns — it's a false positive.
+
+## caveman-shrink (MCP middleware)
+
+Wrap any MCP server. Cut the prose. Keep the substance.
+
+```jsonc
+{
+  "mcpServers": {
+    "fs-shrunk": {
+      "command": "npx",
+      "args": [
+        "caveman-shrink",
+        "npx", "@modelcontextprotocol/server-filesystem", "/path/to/dir"
+      ]
+    }
+  }
+}
+```
+
+`caveman-shrink` is a stdio proxy. It spawns the upstream MCP server, intercepts `tools/list` / `prompts/list` / `resources/list` responses, and runs caveman compression over the `description` fields (and anything else you list in `CAVEMAN_SHRINK_FIELDS`). Code, URLs, paths, and identifiers stay byte-for-byte identical — same boundaries as the parent skill.
+
+What it does NOT touch in v1: tool-call response bodies, request bodies, or any non-prose data. See [`mcp-servers/caveman-shrink/`](mcp-servers/caveman-shrink) for full docs.
 
 ## Benchmarks
 

@@ -37,3 +37,23 @@ if ([string]::IsNullOrEmpty($Mode) -or $Mode -eq "full") {
     $Suffix = $Mode.ToUpperInvariant()
     [Console]::Write("${Esc}[38;5;172m[CAVEMAN:$Suffix]${Esc}[0m")
 }
+
+# Optional savings suffix: opt-in via CAVEMAN_STATUSLINE_SAVINGS=1.
+# Reads a pre-rendered string written by caveman-stats.js. Refuses reparse
+# points and strips control bytes (matches statusline.sh hardening).
+if ($env:CAVEMAN_STATUSLINE_SAVINGS -eq "1") {
+    $SavingsFile = Join-Path $ClaudeDir ".caveman-statusline-suffix"
+    if (Test-Path $SavingsFile) {
+        try {
+            $SavingsItem = Get-Item -LiteralPath $SavingsFile -Force -ErrorAction Stop
+            if (-not ($SavingsItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and
+                $SavingsItem.Length -le 64) {
+                $Savings = (Get-Content -LiteralPath $SavingsFile -Raw -ErrorAction Stop).TrimEnd()
+                $Savings = ($Savings -replace '[\x00-\x1F]', '')
+                if ($Savings.Length -gt 0) {
+                    [Console]::Write(" ${Esc}[38;5;172m$Savings${Esc}[0m")
+                }
+            }
+        } catch {}
+    }
+}
