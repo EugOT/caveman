@@ -578,8 +578,11 @@ const OPENCODE_AGENTS_MD_BEGIN = '<!-- caveman-begin -->';
 const OPENCODE_AGENTS_MD_END = '<!-- caveman-end -->';
 
 function opencodeConfigDir() {
-  // opencode uses ~/.config/opencode on every platform (on Windows that's
+  // OPENCODE_CONFIG_DIR is the native override opencode itself searches for
+  // agents, commands, modes, and plugins. Without it, opencode uses
+  // ~/.config/opencode on every platform (on Windows that's
   // %USERPROFILE%\.config\opencode via os.homedir()), NOT %APPDATA% (#376).
+  if (process.env.OPENCODE_CONFIG_DIR) return process.env.OPENCODE_CONFIG_DIR;
   if (process.env.XDG_CONFIG_HOME) return path.join(process.env.XDG_CONFIG_HOME, 'opencode');
   return path.join(os.homedir(), '.config', 'opencode');
 }

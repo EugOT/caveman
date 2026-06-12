@@ -274,6 +274,15 @@ test('pruneOrphanedManagedHooks drops orphaned managed statusLine', () => {
   assert.equal(s.statusLine, undefined);
 });
 
+test('pruneOrphanedManagedHooks drops orphaned managed PowerShell statusLine', () => {
+  const s = {
+    statusLine: { type: 'command', command: 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "/no/such/dir/caveman-statusline.ps1"' },
+  };
+  const removed = SETTINGS.pruneOrphanedManagedHooks(s, '/tmp/__cm_cfg_missing');
+  assert.equal(removed, 1);
+  assert.equal(s.statusLine, undefined);
+});
+
 test('claudeConfigDir honors CLAUDE_CONFIG_DIR env', () => {
   const orig = process.env.CLAUDE_CONFIG_DIR;
   process.env.CLAUDE_CONFIG_DIR = '/tmp/__cm_test_cfg';

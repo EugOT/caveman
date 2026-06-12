@@ -184,6 +184,7 @@ const MANAGED_HOOK_BASENAMES = new Set([
   'caveman-mode-tracker.js',
   'caveman-stats.js',
   'caveman-statusline.sh',
+  'caveman-statusline.ps1',
 ]);
 function rewriteLegacyManagedHookCommands(settings, absoluteNode) {
   if (!settings || !settings.hooks || !absoluteNode) return 0;

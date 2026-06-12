@@ -97,6 +97,31 @@ test('opencode fresh install drops plugin, commands, agents, skills, AGENTS.md, 
   }
 });
 
+test('opencode install honors OPENCODE_CONFIG_DIR before XDG_CONFIG_HOME', () => {
+  const xdg = freshTmpDir();
+  const opencodeDir = freshTmpDir();
+  const shimDir = shimOpencode();
+  try {
+    const r = runInstaller(['--only', 'opencode'], {
+      ...process.env,
+      OPENCODE_CONFIG_DIR: opencodeDir,
+      XDG_CONFIG_HOME: xdg,
+      PATH: pathWith(shimDir),
+      NO_COLOR: '1',
+    });
+    assert.notEqual(r.status, 2, `argv error: ${r.stderr}`);
+
+    assert.ok(fs.existsSync(path.join(opencodeDir, 'plugins', 'caveman', 'plugin.js')), 'plugin.js missing from OPENCODE_CONFIG_DIR');
+    assert.ok(fs.existsSync(path.join(opencodeDir, 'commands', 'caveman.md')), 'command missing from OPENCODE_CONFIG_DIR');
+    assert.ok(fs.existsSync(path.join(opencodeDir, 'opencode.json')), 'opencode.json missing from OPENCODE_CONFIG_DIR');
+    assert.equal(fs.existsSync(path.join(xdg, 'opencode', 'plugins', 'caveman', 'plugin.js')), false);
+  } finally {
+    fs.rmSync(xdg, { recursive: true, force: true });
+    fs.rmSync(opencodeDir, { recursive: true, force: true });
+    fs.rmSync(shimDir, { recursive: true, force: true });
+  }
+});
+
 // ── 2. Idempotency: install twice, plugin array stays length 1 ───────────
 test('opencode idempotent install does not duplicate plugin entries', () => {
   const xdg = freshTmpDir();
