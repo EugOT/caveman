@@ -24,7 +24,7 @@ What it does:
 
 - Auto-detects every supported agent installed on your machine (Claude Code, Cursor, Codex, etc.).
 - For each one, runs that agent's native install path (plugin / extension / rule file / `npx skills add`).
-- Wires Claude Code hooks and statusline badge on top. (`caveman-shrink` MCP middleware is opt-in via `--with-mcp-shrink` — see flag table below.)
+- Wires Claude Code hooks and statusline badge on top. OpenClaw and NullClaw get workspace skills. (`caveman-shrink` MCP middleware is opt-in via `--with-mcp-shrink` — see flag table below.)
 - Skips anything you don't have. Safe to re-run. ~30 seconds end-to-end.
 
 Want to preview before installing? Use `--dry-run`:
@@ -43,7 +43,8 @@ If you want to install for one agent (or want to know exactly what command runs 
 | **Gemini CLI** | `gemini extensions install https://github.com/JuliusBrussee/caveman` | Yes |
 | **opencode** | `node bin/install.js --only opencode` *(or `npx -y github:JuliusBrussee/caveman -- --only opencode`)* | Yes (plugin + AGENTS.md) |
 | **OpenClaw** | `npx -y github:JuliusBrussee/caveman -- --only openclaw` | Yes (workspace skill + SOUL.md) |
-| **Codex CLI** | `npx skills add JuliusBrussee/caveman -a codex` | Per-session: `/caveman` |
+| **NullClaw** | `npx -y github:JuliusBrussee/caveman -- --only nullclaw` | Yes (workspace skill with `always: true`) |
+| **Codex CLI / Codex app** | `npx skills add JuliusBrussee/caveman -a codex` *(aliases: `codex-cli`, `codex-app`)* | Per-session: `/caveman`; add `--with-init` for `AGENTS.md` + `.codex/skills/` |
 | **Cursor** | `npx skills add JuliusBrussee/caveman -a cursor` | Per-session by default; `--with-init` for an always-on rule file |
 | **Windsurf** | `npx skills add JuliusBrussee/caveman -a windsurf` | Per-session by default; `--with-init` for an always-on rule file |
 | **Cline** | `npx skills add JuliusBrussee/caveman -a cline` | Per-session by default; `--with-init` for an always-on rule file |
@@ -69,14 +70,17 @@ If you want to install for one agent (or want to know exactly what command runs 
 | **Tabnine CLI** | `npx skills add JuliusBrussee/caveman -a tabnine-cli` | No |
 | **Trae** | `npx skills add JuliusBrussee/caveman -a trae` | No |
 | **Warp** | `npx skills add JuliusBrussee/caveman -a warp` | No |
+| **Warp Preview** | `node bin/install.js --only warpPreview` *(alias of `warp`)* | No |
 | **Replit Agent** | `npx skills add JuliusBrussee/caveman -a replit` | No |
 | **JetBrains Junie** *(soft probe)* | `npx skills add JuliusBrussee/caveman -a junie` | No |
 | **Qoder** *(soft probe)* | `npx skills add JuliusBrussee/caveman -a qoder` | No |
-| **Google Antigravity** *(soft probe)* | `npx skills add JuliusBrussee/caveman -a antigravity` | No |
+| **Google Antigravity** *(soft probe)* | `npx skills add JuliusBrussee/caveman -a antigravity` *(aliases: `antigravity-cli`, `antigravity-app`)* | No; add `--with-init` for `AGENTS.md` |
 
 "Soft probe" = installer won't auto-detect these without `--only <id>` because there's no reliable always-on signal (Copilot subscription state is auth-gated; the others have no CLI / config-dir-only). Pass the flag when you want them.
 
 For "auto-activates? No" agents, type `/caveman` once per session (or use natural-language triggers like "talk like caveman", "caveman mode").
+
+Repo-local harness aliases without a stable `skills` profile use `--with-init`: `claude-desktop`, `zeroclaw`, `goclaw`, `hermes`, `pi`, `pz`, `walcode`, `walkode`, and `claw`. These write only the context/skill files those harnesses can read (`AGENTS.md`, `.pi/skills/`, `.pz/skills/`, `.claw/instructions.md`, `.codex/skills/`, or `.claude/skills/`), and the installer refuses to follow existing symlink targets.
 
 **Finding a profile slug for `npx skills add ... -a <profile>`?** Either read the table above, or print the live matrix from the installer:
 
@@ -118,17 +122,19 @@ Useful flags:
 | `--minimal` | Plugin / extension only. No hooks, no MCP shrink, no per-repo rules. |
 | `--only <id>` | One agent only. Repeatable: `--only claude --only cursor`. |
 | `--dry-run` | Print every command. Write nothing. |
-| `--with-init` | Drop always-on rule files into the current repo (`.cursor/`, `.windsurf/`, `.clinerules/`, `.github/copilot-instructions.md`, `.opencode/AGENTS.md`, `AGENTS.md`) and, if OpenClaw is on the box, append the bootstrap block to `~/.openclaw/workspace/SOUL.md`. |
+| `--with-init` | Drop always-on rule files into the current repo (`.cursor/`, `.windsurf/`, `.clinerules/`, `.github/copilot-instructions.md`, `.opencode/AGENTS.md`, `AGENTS.md`) and, if OpenClaw is on the box, append the bootstrap block to `~/.openclaw/workspace/SOUL.md`. With explicit aliases it can also write repo-local skill/context targets such as `.codex/skills/`, `.claude/skills/`, `.pi/skills/`, `.pz/skills/`, and `.claw/instructions.md`. |
 | `--with-mcp-shrink="<upstream cmd>"` | Register `caveman-shrink` MCP proxy wrapping the given upstream MCP server. **Off by default.** A value is required — caveman-shrink is a proxy and exits immediately without one. Example: `--with-mcp-shrink="npx @modelcontextprotocol/server-filesystem /tmp"`. The value is split on whitespace; for paths-with-spaces, install via `node bin/install.js` from a clone or edit `~/.claude.json` after a stub install. |
 | `--no-mcp-shrink` | Skip MCP-shrink registration. (Default.) |
 | `--with-hooks` / `--no-hooks` | Force-on or force-off the Claude Code hook installer. (Default: on.) |
 | `--skip-skills` | Don't run the npx-skills auto-detect fallback when nothing else matched. |
-| `--config-dir <path>` | Claude Code config dir for hook files + `settings.json`. **Does NOT scope** `claude plugin install`, `gemini extensions install`, opencode (`XDG_CONFIG_HOME`), or openclaw (`OPENCLAW_WORKSPACE`) — those use their own paths. Default: `$CLAUDE_CONFIG_DIR` or `~/.claude`. `~` is expanded. |
+| `--config-dir <path>` | Claude Code config dir for hook files + `settings.json`. **Does NOT scope** `claude plugin install`, `gemini extensions install`, opencode (`XDG_CONFIG_HOME`), openclaw (`OPENCLAW_WORKSPACE`), or nullclaw (`NULLCLAW_WORKSPACE` / `NULLCLAW_HOME`) — those use their own paths. Default: `$CLAUDE_CONFIG_DIR` or `~/.claude`. `~` is expanded. |
 | `--non-interactive` | Never prompt; use defaults. (Auto when stdin is not a TTY.) |
 | `--no-color` | Disable ANSI colors. |
 | `--list` | Print full agent matrix and exit. |
 | `--force` | Re-run even if already installed. |
 | `--uninstall` | Remove everything. See below. |
+
+NullClaw workspace resolution is `NULLCLAW_WORKSPACE` first. If that is unset, `NULLCLAW_HOME` is used as the home directory and the workspace is `$NULLCLAW_HOME/workspace`; if both are unset, `NULLCLAW_HOME` effectively defaults to `~/.nullclaw`, so the workspace is `~/.nullclaw/workspace`.
 
 ## Always-on rules
 
@@ -144,6 +150,15 @@ curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/src/rule
 ```
 
 `--with-init` writes the rule into every supported per-agent location it can detect (`.cursor/rules/`, `.windsurf/rules/`, `.clinerules/`, `.github/copilot-instructions.md`, `.opencode/AGENTS.md`, `AGENTS.md`). It also installs the OpenClaw workspace bootstrap (skill folder + SOUL.md marker block) when `~/.openclaw/workspace/` exists. Single source: [`src/rules/caveman-activate.md`](src/rules/caveman-activate.md).
+
+For explicit harness aliases, scope the write:
+
+```bash
+node bin/install.js --with-init --only pi
+node bin/install.js --with-init --only pz
+node bin/install.js --with-init --only walcode   # also works for walkode/claw
+node bin/install.js --with-init --only claude-desktop
+```
 
 ## Verify
 
@@ -185,6 +200,7 @@ What it removes:
 - The Claude Code plugin and the Gemini CLI extension (if installed).
 - The opencode native plugin (`~/.config/opencode/plugins/caveman/`, the `plugin` and `mcp.caveman-shrink` entries from `opencode.json`, our skill/agent/command files, the caveman block from `AGENTS.md`, and the opencode flag file).
 - The OpenClaw workspace skill folder and the marker-fenced block from `~/.openclaw/workspace/SOUL.md` (when present).
+- The NullClaw workspace skill folder at `$NULLCLAW_WORKSPACE/skills/caveman/`, `$NULLCLAW_HOME/workspace/skills/caveman/`, or `~/.nullclaw/workspace/skills/caveman/` using that precedence.
 - The `.caveman-active` flag file.
 
 What it does **not** remove:
@@ -252,6 +268,7 @@ The installer doesn't phone home. It writes to:
 - Each agent's own config location — Cursor's `.cursor/rules/`, Windsurf's `.windsurf/rules/`, opencode's `~/.config/opencode/`, etc.
 - Your current working directory (only with `--with-init`) — repo-local rule files.
 - `~/.openclaw/workspace/` (only with `--only openclaw` or `--with-init` when OpenClaw is detected) — the one `--with-init` side-effect outside the cwd.
+- `~/.nullclaw/workspace/`, `$NULLCLAW_HOME/workspace/`, or `$NULLCLAW_WORKSPACE/` (only with `--only nullclaw`; `NULLCLAW_WORKSPACE` wins over `NULLCLAW_HOME`) — NullClaw skill install.
 
 No telemetry. No analytics. The installer's own code makes no network calls. Network requests do happen indirectly through the per-agent CLIs it shells out to — `claude plugin marketplace add`, `claude plugin install`, `gemini extensions install`, `npm view caveman-shrink`, and `npx -y skills add`. Each fetches from its own registry (Anthropic / GitHub / npm). Source: [`bin/install.js`](bin/install.js).
 

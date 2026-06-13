@@ -13,6 +13,8 @@ const INIT = path.join(ROOT, 'src', 'tools', 'caveman-init.js');
 
 let passed = 0;
 let failed = 0;
+let skipped = 0;
+const SYMLINK_SETUP_SKIP_CODES = new Set(['EACCES', 'ENOSYS', 'ENOTSUP', 'EPERM']);
 
 // Point OPENCLAW_WORKSPACE at a nonexistent dir inside the fixture so the
 // openclaw target reports skipped-workspace-missing instead of writing to
@@ -20,14 +22,27 @@ let failed = 0;
 function runInit(tmp, ...args) {
   return execFileSync(process.execPath, [INIT, tmp, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, OPENCLAW_WORKSPACE: path.join(tmp, 'no-openclaw') },
+    env: {
+      ...process.env,
+      OPENCLAW_WORKSPACE: path.join(tmp, 'no-openclaw'),
+      NULLCLAW_WORKSPACE: path.join(tmp, 'no-nullclaw'),
+    },
   });
+}
+
+function isSymlinkSetupUnsupported(e) {
+  return e && SYMLINK_SETUP_SKIP_CODES.has(e.code);
 }
 
 function test(name, fn) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman-init-test-'));
   try {
-    fn(tmp);
+    const result = fn(tmp);
+    if (result && result.skip) {
+      skipped++;
+      console.log(`  - ${name} (skipped: ${result.skip})`);
+      return;
+    }
     passed++;
     console.log(`  ✓ ${name}`);
   } catch (e) {
@@ -112,6 +127,84 @@ test('--only filters to one target', (tmp) => {
   assert.ok(!fs.existsSync(path.join(tmp, '.cursor')));
 });
 
+test('--only codex-app writes AGENTS.md plus Codex project skill', (tmp) => {
+  const out = runInit(tmp, '--only', 'codex-app');
+  assert.match(out, /2 added/);
+  assert.ok(fs.existsSync(path.join(tmp, 'AGENTS.md')));
+  const skill = fs.readFileSync(path.join(tmp, '.codex/skills/caveman/SKILL.md'), 'utf8');
+  assert.match(skill, /^---\nname: caveman/m);
+  assert.match(skill, /Respond terse like smart caveman/);
+  assert.ok(!fs.existsSync(path.join(tmp, '.cursor')));
+});
+
+test('--only pi writes AGENTS.md plus Pi project skill', (tmp) => {
+  const out = runInit(tmp, '--only', 'pi');
+  assert.match(out, /2 added/);
+  assert.ok(fs.existsSync(path.join(tmp, 'AGENTS.md')));
+  assert.ok(fs.existsSync(path.join(tmp, '.pi/skills/caveman/SKILL.md')));
+});
+
+test('--only pz writes AGENTS.md plus pz project skill', (tmp) => {
+  const out = runInit(tmp, '--only', 'pz');
+  assert.match(out, /2 added/);
+  assert.ok(fs.existsSync(path.join(tmp, 'AGENTS.md')));
+  assert.ok(fs.existsSync(path.join(tmp, '.pz/skills/caveman/SKILL.md')));
+});
+
+test('--only walcode writes claw instructions plus shared Codex-style skill', (tmp) => {
+  const out = runInit(tmp, '--only', 'walcode');
+  assert.match(out, /2 added/);
+  const instructions = fs.readFileSync(path.join(tmp, '.claw/instructions.md'), 'utf8');
+  assert.match(instructions, /Respond terse like smart caveman/);
+  assert.ok(fs.existsSync(path.join(tmp, '.codex/skills/caveman/SKILL.md')));
+});
+
+test('--only claude-desktop writes AGENTS.md plus Claude project skill', (tmp) => {
+  const out = runInit(tmp, '--only', 'claude-desktop');
+  assert.match(out, /2 added/);
+  assert.ok(fs.existsSync(path.join(tmp, 'AGENTS.md')));
+  assert.ok(fs.existsSync(path.join(tmp, '.claude/skills/caveman/SKILL.md')));
+});
+
+test('safety: refuses to write through existing symlink targets', (tmp) => {
+  const outside = path.join(tmp, '..', `caveman-init-outside-${process.pid}.md`);
+  fs.writeFileSync(outside, 'outside stays unchanged\n');
+  try {
+    fs.symlinkSync(outside, path.join(tmp, 'AGENTS.md'));
+  } catch (e) {
+    fs.rmSync(outside, { force: true });
+    if (isSymlinkSetupUnsupported(e)) return { skip: `symlink setup unsupported: ${e.code}` };
+    throw e;
+  }
+  try {
+    const out = runInit(tmp, '--only', 'antigravity-app');
+    assert.match(out, /skipped-symlink/);
+    assert.strictEqual(fs.readFileSync(outside, 'utf8'), 'outside stays unchanged\n');
+  } finally {
+    fs.rmSync(outside, { force: true });
+  }
+});
+
+test('safety: refuses to write through symlinked parent directories', (tmp) => {
+  const outsideDir = path.join(tmp, '..', `caveman-init-outside-dir-${process.pid}`);
+  fs.mkdirSync(outsideDir);
+  try {
+    fs.symlinkSync(outsideDir, path.join(tmp, '.codex'));
+  } catch (e) {
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+    if (isSymlinkSetupUnsupported(e)) return { skip: `symlink setup unsupported: ${e.code}` };
+    throw e;
+  }
+  try {
+    const out = runInit(tmp, '--only', 'codex-app');
+    assert.match(out, /skipped-unsafe-parent/);
+    assert.ok(fs.existsSync(path.join(tmp, 'AGENTS.md')), 'AGENTS.md should still be written');
+    assert.equal(fs.existsSync(path.join(outsideDir, 'skills', 'caveman', 'SKILL.md')), false, 'skill should not be written through parent symlink');
+  } finally {
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
 test('detects sentinel and skips files that already have caveman content', (tmp) => {
   // Hand-write a file that already contains the rule (simulating prior install).
   const dir = path.join(tmp, '.clinerules');
@@ -122,5 +215,5 @@ test('detects sentinel and skips files that already have caveman content', (tmp)
   assert.match(out, /skipped-already-installed/);
 });
 
-console.log(`\n${passed} passed, ${failed} failed`);
+console.log(`\n${passed} passed, ${skipped} skipped, ${failed} failed`);
 process.exit(failed ? 1 : 0);

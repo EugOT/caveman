@@ -14,7 +14,9 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const INSTALLER = path.resolve(HERE, '..', '..', 'bin', 'install.js');
 
 function run(...args) {
-  return spawnSync('node', [INSTALLER, ...args], { encoding: 'utf8' });
+  const last = args[args.length - 1];
+  const options = last && typeof last === 'object' && !Array.isArray(last) ? args.pop() : {};
+  return spawnSync('node', [INSTALLER, ...args], { encoding: 'utf8', ...options });
 }
 
 test('--help prints usage and exits 0', () => {
@@ -30,7 +32,10 @@ test('--list prints provider matrix', () => {
   assert.match(r.stdout, /caveman provider matrix/);
   assert.match(r.stdout, /claude\b/);
   assert.match(r.stdout, /gemini\b/);
+  assert.match(r.stdout, /nullclaw\b/);
   assert.match(r.stdout, /antigravity\b.*\(soft\)/);
+  assert.match(r.stdout, /codex-app\/codex-cli/);
+  assert.match(r.stdout, /warpPreview\/warp-preview/);
 });
 
 test('unknown flag exits 2 with error', () => {
@@ -67,6 +72,51 @@ test('aider alias rewrites to aider-desk in dry-run output', () => {
   const r = run('--dry-run', '--only', 'aider', '--non-interactive', '--config-dir', '/tmp/__cm_alias_test');
   // No detection means no install lines, but the script should not crash.
   assert.equal(r.status, 0);
+});
+
+test('provider aliases pass argv validation', () => {
+  for (const id of ['codex-cli', 'codex-app', 'antigravity-cli', 'antigravity-app', 'claude-code', 'warpPreview']) {
+    const r = run('--dry-run', '--only', id, '--non-interactive', '--config-dir', '/tmp/__cm_alias_matrix');
+    assert.equal(r.status, 0, `${id} failed validation: ${r.stderr}`);
+  }
+});
+
+test('repo-only harness ids require --with-init or --all', () => {
+  const r = run('--dry-run', '--only', 'pi', '--non-interactive', '--config-dir', '/tmp/__cm_pi_no_init');
+  assert.equal(r.status, 2);
+  assert.match(r.stderr, /pi is a repo-local init target/);
+});
+
+test('repo-only harness ids are forwarded to caveman-init with --with-init', () => {
+  const r = run('--dry-run', '--with-init', '--only', 'pi', '--non-interactive', '--config-dir', '/tmp/__cm_pi_init');
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /would run: .*caveman-init\.js .* --only pi/);
+});
+
+test('agents init target is forwarded with --with-init', () => {
+  const r = run('--dry-run', '--with-init', '--only', 'agents', '--non-interactive', '--config-dir', '/tmp/__cm_agents_init');
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /would run: .*caveman-init\.js .* --only agents/);
+});
+
+test('claw init-only id is forwarded with --with-init', () => {
+  const r = run('--dry-run', '--with-init', '--only', 'claw', '--non-interactive', '--config-dir', '/tmp/__cm_claw_init');
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /would run: .*caveman-init\.js .* --only claw/);
+});
+
+test('repo-only harness ids are accepted with --all', () => {
+  const r = run('--dry-run', '--all', '--only', 'pi', '--non-interactive', '--config-dir', '/tmp/__cm_pi_all');
+  assert.equal(r.status, 0);
+  assert.match(r.stdout, /would run: .*caveman-init\.js .* --only pi/);
+});
+
+test('case-insensitive warpPreview alias normalizes to warp provider', () => {
+  const r = run('--dry-run', '--only', 'warpPreview', '--non-interactive', '--config-dir', '/tmp/__cm_warppreview');
+  assert.equal(r.status, 0);
+  if (/Warp detected/.test(r.stdout)) {
+    assert.match(r.stdout, /skills add JuliusBrussee\/caveman --skill \* -a warp --yes/);
+  }
 });
 
 test('--only with unknown agent id exits 2', () => {

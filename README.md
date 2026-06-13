@@ -129,7 +129,7 @@ Install break? Open agent, say *"Read CLAUDE.md and INSTALL.md, install caveman 
 
 **Statusline badge** — Claude Code shows `[CAVEMAN] ⛏ 12.4k` (lifetime tokens saved). Updates every `/caveman-stats` run. Set `CAVEMAN_STATUSLINE_SAVINGS=0` to silence.
 
-Auto-activate every session: Claude Code, Codex, Gemini (built-in). Cursor / Windsurf / Cline / Copilot get always-on rule files via `--with-init`. Other agents trigger with `/caveman` per session. Full feature matrix in [INSTALL.md](./INSTALL.md#what-you-get).
+Auto-activate every session: Claude Code and Gemini (built-in), plus OpenClaw / NullClaw workspace skills. Codex app/CLI gets per-session `/caveman` by default, or `AGENTS.md` + `.codex/skills/` via explicit `--with-init --only codex-app` / `--with-init --only codex-cli`. Cursor / Windsurf / Cline / Copilot get always-on rule files via `--with-init`; local harnesses like Pi, pz, walcode/walkode, and ZeroClaw-style flows use explicit `--with-init --only <alias>` targets. Other agents trigger with `/caveman` per session. Full feature matrix in [INSTALL.md](./INSTALL.md#per-agent-install).
 
 ## Benchmarks
 
