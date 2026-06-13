@@ -24,6 +24,7 @@ const crypto = require('crypto');
 
 const SETTINGS = require('./lib/settings');
 const OPENCLAW = require('./lib/openclaw');
+const NULLCLAW = require('./lib/nullclaw');
 const { stripOpencodeAgentTools } = require('./lib/opencode-agent');
 
 const REPO = 'JuliusBrussee/caveman';
@@ -51,13 +52,66 @@ const HOOK_FILES = [
   'caveman-statusline.ps1',
 ];
 
+const PROVIDER_ALIASES = new Map([
+  ['aider', 'aider-desk'],
+  ['claude-code', 'claude'],
+  ['codex-app', 'codex'],
+  ['codex-cli', 'codex'],
+  ['antigravity-app', 'antigravity'],
+  ['antigravity-cli', 'antigravity'],
+  ['warp-preview', 'warp'],
+  ['warppreview', 'warp'],
+]);
+
+const INIT_ONLY_AGENTS = new Set([
+  'claude-desktop',
+  'zeroclaw',
+  'goclaw',
+  'hermes',
+  'pi',
+  'pz',
+  'walcode',
+  'walkode',
+  'claw',
+]);
+
+const INIT_TARGET_ALIASES = new Set([
+  'agents',
+  'antigravity',
+  'antigravity-app',
+  'antigravity-cli',
+  'claude',
+  'claude-code',
+  'claude-desktop',
+  'cline',
+  'codex',
+  'codex-app',
+  'codex-cli',
+  'copilot',
+  'cursor',
+  'goclaw',
+  'hermes',
+  'nullclaw',
+  'opencode',
+  'openclaw',
+  'pi',
+  'pz',
+  'walcode',
+  'walkode',
+  'warp',
+  'warp-preview',
+  'warppreview',
+  'windsurf',
+  'zeroclaw',
+]);
+
 // ── Argv ───────────────────────────────────────────────────────────────────
 function parseArgs(argv) {
   const opts = {
     dryRun: false, force: false, skipSkills: false,
     withHooks: 'auto', withInit: false, withMcpShrink: false,
     all: false, minimal: false, listOnly: false, noColor: false,
-    only: [], uninstall: false, nonInteractive: false,
+    only: [], initOnly: [], uninstall: false, nonInteractive: false,
     configDir: null, help: false,
   };
   for (let i = 0; i < argv.length; i++) {
@@ -115,7 +169,9 @@ function parseArgs(argv) {
       case '--only': {
         const v = argv[++i];
         if (!v) die('error: --only requires an argument');
-        opts.only.push(v === 'aider' ? 'aider-desk' : v);
+        const id = normalizeAgentId(v);
+        opts.only.push(resolveProviderOnlyId(id));
+        if (INIT_TARGET_ALIASES.has(id) || INIT_ONLY_AGENTS.has(id)) opts.initOnly.push(id);
         break;
       }
       case '--config-dir': {
@@ -143,8 +199,13 @@ function parseArgs(argv) {
   if (opts.only.length) {
     const knownIds = new Set(PROVIDERS.map(p => p.id));
     for (const id of opts.only) {
-      if (!knownIds.has(id)) {
+      const isProvider = knownIds.has(id);
+      const isInitTarget = INIT_TARGET_ALIASES.has(id) || INIT_ONLY_AGENTS.has(id);
+      if (!isProvider && !isInitTarget) {
         die(`error: unknown agent: ${id}\n  see 'caveman --list' for valid ids`);
+      }
+      if (!isProvider && isInitTarget && !opts.withInit) {
+        die(`error: ${id} is a repo-local init target; pass --with-init or --all`);
       }
     }
   }
@@ -152,6 +213,14 @@ function parseArgs(argv) {
 }
 
 function die(msg) { process.stderr.write(msg + '\n'); process.exit(2); }
+
+function normalizeAgentId(id) {
+  return String(id).trim().replace(/_/g, '-').toLowerCase();
+}
+
+function resolveProviderOnlyId(id) {
+  return PROVIDER_ALIASES.get(id) || id;
+}
 
 // ── Color helpers ──────────────────────────────────────────────────────────
 function makeChalk(noColor) {
@@ -207,6 +276,7 @@ const PROVIDERS = [
   { id: 'gemini',     label: 'Gemini CLI',          mech: 'gemini extensions install',     detect: 'command:gemini' },
   { id: 'opencode',   label: 'opencode',            mech: 'native opencode plugin',        detect: 'command:opencode' },
   { id: 'openclaw',   label: 'OpenClaw',            mech: 'workspace skill + SOUL.md',     detect: 'command:openclaw||dir:$HOME/.openclaw/workspace' },
+  { id: 'nullclaw',   label: 'NullClaw',            mech: 'workspace skill',               detect: 'command:nullclaw' },
   { id: 'codex',      label: 'Codex CLI',           mech: 'npx skills add (codex)',        detect: 'command:codex',           profile: 'codex' },
 
   // IDE / VS Code-family — extension probes are precise. Cursor/Windsurf also
@@ -801,6 +871,34 @@ function installOpenclaw(ctx) {
   process.stdout.write('\n');
 }
 
+// ── NullClaw native install ───────────────────────────────────────────────
+// Drops skills/caveman/SKILL.md into the NullClaw workspace with always:true
+// frontmatter. NullClaw then injects the full skill instructions each turn.
+function installNullclaw(ctx) {
+  const { say, note, warn, opts, repoRoot, results } = ctx;
+  results.detected++;
+  say('→ NullClaw detected');
+
+  const log = {
+    write: (s) => process.stdout.write(s),
+    note: (s) => note(s),
+    warn: (s) => warn(s),
+  };
+
+  const r = NULLCLAW.installNullclaw({
+    workspace: process.env.NULLCLAW_WORKSPACE || undefined,
+    repoRoot,
+    dryRun: opts.dryRun,
+    force: opts.force,
+    log,
+  });
+
+  if (r.ok) results.installed.push('nullclaw');
+  else results.failed.push(['nullclaw', r.reason || 'install failed']);
+
+  process.stdout.write('\n');
+}
+
 // ── Hooks installer ────────────────────────────────────────────────────────
 // Replaces src/hooks/install.sh + src/hooks/install.ps1.
 async function installHooks(ctx) {
@@ -963,6 +1061,12 @@ async function runInit(ctx) {
   const args = [process.cwd()];
   if (opts.dryRun) args.push('--dry-run');
   if (opts.force)  args.push('--force');
+  const initOnly = [...new Set(opts.initOnly)];
+  for (const id of initOnly) args.push('--only', id);
+  if (opts.only.length && initOnly.length === 0) {
+    note('  no repo-local init target matches selected --only agent(s); skipping');
+    return true;
+  }
   if (local && fs.existsSync(local)) {
     const r = runSpawn(absoluteNodePath(), [local, ...args], null, opts.dryRun);
     return (r.status || 0) === 0;
@@ -1191,6 +1295,18 @@ function uninstall(ctx) {
     if (r.touched) ok('  pruned caveman entries from OpenClaw workspace');
   }
 
+  // NullClaw native install — remove only our skill folder.
+  const ncWs = process.env.NULLCLAW_WORKSPACE || NULLCLAW.resolveWorkspace();
+  if (fs.existsSync(path.join(ncWs, 'skills', 'caveman'))) {
+    const log = {
+      write: (s) => process.stdout.write(s),
+      note: (s) => note(s),
+      warn: (s) => warn(s),
+    };
+    const r = NULLCLAW.uninstallNullclaw({ workspace: ncWs, dryRun: opts.dryRun, log });
+    if (r.touched) ok('  pruned caveman skill from NullClaw workspace');
+  }
+
   // Flag file
   const flag = path.join(configDir, '.caveman-active');
   if (fs.existsSync(flag) && !opts.dryRun) { try { fs.unlinkSync(flag); } catch (_) {} }
@@ -1230,6 +1346,9 @@ function printList(noColor) {
     process.stdout.write(`  ${pad(p.id, 13)} ${pad(p.label, 22)} ${p.mech}${tag}\n`);
   }
   process.stdout.write('\n');
+  process.stdout.write(c.dim('  Aliases: aider→aider-desk, claude-code→claude, codex-app/codex-cli→codex,\n'));
+  process.stdout.write(c.dim('           antigravity-app/antigravity-cli→antigravity, warpPreview/warp-preview→warp.\n'));
+  process.stdout.write(c.dim('  Repo-only init ids: agents, claude-desktop, zeroclaw, goclaw, hermes, pi, pz, walcode, walkode, claw.\n'));
   process.stdout.write(c.dim('  Defaults: --with-hooks ON, --with-init OFF, --with-mcp-shrink OFF.\n'));
   process.stdout.write(c.dim('  --all = hooks + init (mcp-shrink needs an upstream — opt in explicitly).\n'));
   process.stdout.write(c.dim('  --minimal turns hooks + init + mcp-shrink off.\n'));
@@ -1251,7 +1370,8 @@ FLAGS
   --dry-run             Print what would run, do nothing.
   --force               Re-run even if a target reports already installed.
   --only <agent>        Install only for the named agent. Repeatable.
-                        See --list for valid ids.
+                        See --list for valid ids and aliases. Repo-only
+                        harness ids require --with-init or --all.
   --skip-skills         Don't run the npx-skills auto-detect fallback.
   --all                 Turn on hooks + init. (mcp-shrink needs an upstream;
                         pass --with-mcp-shrink="<cmd>" to add it.)
@@ -1271,8 +1391,10 @@ FLAGS
   --config-dir <path>   Claude Code config dir for hook files + settings.json.
                         Default: \$CLAUDE_CONFIG_DIR or ~/.claude. Does NOT
                         scope \`claude plugin install\`, \`gemini extensions
-                        install\`, opencode (XDG_CONFIG_HOME), or openclaw
-                        (OPENCLAW_WORKSPACE) — those use their own paths.
+                        install\`, opencode (XDG_CONFIG_HOME), openclaw
+                        (OPENCLAW_WORKSPACE), or nullclaw
+                        (NULLCLAW_WORKSPACE/NULLCLAW_HOME) — those use their
+                        own paths.
   --non-interactive     Never prompt; use defaults. (Auto when stdin is not a TTY.)
   --list                Print provider matrix and exit.
   --no-color            Disable ANSI colors.
@@ -1282,6 +1404,7 @@ EXAMPLES
   npx -y github:JuliusBrussee/caveman                        # default install
   npx -y github:JuliusBrussee/caveman -- --all               # all the trimmings
   npx -y github:JuliusBrussee/caveman -- --only claude --no-mcp-shrink
+  npx -y github:JuliusBrussee/caveman -- --with-init --only pi
   npx -y github:JuliusBrussee/caveman -- --uninstall
 
   Issues: https://github.com/${REPO}/issues
@@ -1346,6 +1469,7 @@ async function main() {
     if (prov.id === 'gemini')   { installGemini(ctx); continue; }
     if (prov.id === 'opencode') { installOpencode(ctx); continue; }
     if (prov.id === 'openclaw') { installOpenclaw(ctx); continue; }
+    if (prov.id === 'nullclaw') { installNullclaw(ctx); continue; }
     if (prov.profile)           { installViaSkills(ctx, prov); continue; }
   }
 

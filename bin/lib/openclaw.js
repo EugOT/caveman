@@ -26,6 +26,8 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+const { readIfExists, unsafeParentReason, unsafeTargetReason, unsafeWriteReason, writeFileSafe } = require('./fs-safe');
+
 const SKILL_NAME = 'caveman';
 const SKILL_VERSION = '1.0.0';
 const MARK_BEGIN = '<!-- caveman-begin -->';
@@ -35,10 +37,6 @@ const SOUL_FILE = 'SOUL.md';
 function resolveWorkspace(env = process.env) {
   if (env.OPENCLAW_WORKSPACE) return path.resolve(env.OPENCLAW_WORKSPACE);
   return path.join(os.homedir(), '.openclaw', 'workspace');
-}
-
-function readIfExists(p) {
-  try { return fs.readFileSync(p, 'utf8'); } catch (_) { return null; }
 }
 
 // ── Frontmatter helpers ───────────────────────────────────────────────────
@@ -116,7 +114,9 @@ function loadSkillBody(repoRoot) {
 }
 
 // ── SOUL.md marker-block append/strip ─────────────────────────────────────
-function appendBootstrapToSoul(soulPath, snippet) {
+function appendBootstrapToSoul(soulPath, snippet, rootDir = path.dirname(soulPath)) {
+  const unsafe = unsafeWriteReason(soulPath, rootDir);
+  if (unsafe) return { changed: false, skipped: true, reason: unsafe };
   const existing = readIfExists(soulPath);
   if (existing && existing.includes(MARK_BEGIN) && existing.includes(MARK_END)) {
     return { changed: false, reason: 'already present' };
@@ -128,11 +128,13 @@ function appendBootstrapToSoul(soulPath, snippet) {
   } else {
     next = snippet;
   }
-  fs.writeFileSync(soulPath, next, { mode: 0o644 });
+  writeFileSafe(soulPath, next, rootDir);
   return { changed: true };
 }
 
-function stripBootstrapFromSoul(soulPath) {
+function stripBootstrapFromSoul(soulPath, rootDir = path.dirname(soulPath)) {
+  const unsafe = unsafeWriteReason(soulPath, rootDir);
+  if (unsafe) return { changed: false, skipped: true, reason: unsafe };
   const existing = readIfExists(soulPath);
   if (!existing) return { changed: false, reason: 'no SOUL.md' };
   const begin = existing.indexOf(MARK_BEGIN);
@@ -150,7 +152,7 @@ function stripBootstrapFromSoul(soulPath) {
     try { fs.unlinkSync(soulPath); } catch (_) {}
     return { changed: true, removed: true };
   }
-  fs.writeFileSync(soulPath, next, { mode: 0o644 });
+  writeFileSafe(soulPath, next, rootDir);
   return { changed: true };
 }
 
@@ -164,6 +166,11 @@ function installOpenclaw({ workspace, repoRoot, dryRun = false, force = false, l
     return { ok: false, reason: 'repo not available' };
   }
   const snippet = loadBootstrapSnippet(repoRoot);
+  const unsafeWorkspace = unsafeTargetReason(ws, true) || unsafeParentReason(path.join(ws, '.caveman-workspace-probe'), path.dirname(ws));
+  if (unsafeWorkspace) {
+    log.warn(`  openclaw unsafe target at ${ws}: ${unsafeWorkspace}.`);
+    return { ok: false, reason: 'unsafe target' };
+  }
 
   if (!fs.existsSync(ws)) {
     if (!force) {
@@ -177,6 +184,15 @@ function installOpenclaw({ workspace, repoRoot, dryRun = false, force = false, l
   const skillDir = path.join(ws, 'skills', SKILL_NAME);
   const skillFile = path.join(skillDir, 'SKILL.md');
   const soulFile = path.join(ws, SOUL_FILE);
+  const unsafeDir = unsafeTargetReason(skillDir, true);
+  const unsafeSkill = unsafeWriteReason(skillFile, ws);
+  const unsafeSoul = unsafeWriteReason(soulFile, ws);
+  if (unsafeDir || unsafeSkill || unsafeSoul) {
+    const target = unsafeDir ? skillDir : (unsafeSkill ? skillFile : soulFile);
+    const reason = unsafeDir || unsafeSkill || unsafeSoul;
+    log.warn(`  openclaw unsafe target at ${target}: ${reason}.`);
+    return { ok: false, reason: 'unsafe target' };
+  }
 
   if (dryRun) {
     log.note(`  would write ${skillFile} (with version/always frontmatter)`);
@@ -184,12 +200,15 @@ function installOpenclaw({ workspace, repoRoot, dryRun = false, force = false, l
     return { ok: true, dryRun: true };
   }
 
-  fs.mkdirSync(skillDir, { recursive: true });
   const merged = mergeOpenclawFrontmatter(skillBody);
-  fs.writeFileSync(skillFile, merged, { mode: 0o644 });
+  writeFileSafe(skillFile, merged, ws);
   log.write(`  installed: ${skillFile}\n`);
 
-  const soul = appendBootstrapToSoul(soulFile, snippet);
+  const soul = appendBootstrapToSoul(soulFile, snippet, ws);
+  if (soul.skipped) {
+    log.warn(`  refused to write ${soulFile}: ${soul.reason}.`);
+    return { ok: false, reason: 'unsafe target' };
+  }
   if (soul.changed) log.write(`  wrote bootstrap block to ${soulFile}\n`);
   else log.note(`  ${soulFile} already contains caveman bootstrap`);
 
@@ -218,7 +237,7 @@ function uninstallOpenclaw({ workspace, dryRun = false, log = noopLog() } = {}) 
       log.note(`  would strip caveman block from ${soulFile}`);
       touched = true;
     } else {
-      const r = stripBootstrapFromSoul(soulFile);
+      const r = stripBootstrapFromSoul(soulFile, ws);
       if (r.changed) {
         log.note(r.removed ? `  removed ${soulFile}` : `  stripped caveman block from ${soulFile}`);
         touched = true;
@@ -247,6 +266,9 @@ module.exports = {
   appendBootstrapToSoul,
   stripBootstrapFromSoul,
   loadBootstrapSnippet,
+  unsafeTargetReason,
+  unsafeParentReason,
+  unsafeWriteReason,
   MARK_BEGIN,
   MARK_END,
   SKILL_NAME,

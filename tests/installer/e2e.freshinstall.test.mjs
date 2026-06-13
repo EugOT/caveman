@@ -38,6 +38,7 @@ const REPO_ROOT = path.resolve(HERE, '..', '..');
 const INSTALLER = path.join(REPO_ROOT, 'bin', 'install.js');
 const requireCjs = createRequire(import.meta.url);
 const SETTINGS = requireCjs(path.join(REPO_ROOT, 'bin', 'lib', 'settings.js'));
+const SYMLINK_SETUP_SKIP_CODES = new Set(['EACCES', 'ENOSYS', 'ENOTSUP', 'EPERM']);
 
 function freshTmpDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'caveman-freshinstall-'));
@@ -61,6 +62,10 @@ function pathWithout(binNames) {
       return true;
     })
     .join(sep);
+}
+
+function isSymlinkSetupUnsupported(e) {
+  return e && SYMLINK_SETUP_SKIP_CODES.has(e.code);
 }
 
 function runInstaller(args, configDir, extraEnv = {}) {
@@ -306,6 +311,67 @@ test('openclaw install is idempotent: skill frontmatter not double-prepended, SO
   }
 });
 
+test('openclaw install refuses symlinked skill file targets', (t) => {
+  const dir = freshTmpDir();
+  const ws = path.join(dir, 'ws');
+  const skillDir = path.join(ws, 'skills', 'caveman');
+  const outside = path.join(dir, 'outside-skill.md');
+  fs.mkdirSync(skillDir, { recursive: true });
+  fs.writeFileSync(outside, 'outside stays unchanged\n');
+  try {
+    fs.symlinkSync(outside, path.join(skillDir, 'SKILL.md'));
+  } catch (e) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (isSymlinkSetupUnsupported(e)) {
+      t.skip(`symlink setup unsupported on this runner: ${e.code}`);
+      return;
+    }
+    throw e;
+  }
+  try {
+    const r = spawnSync('node', [INSTALLER, '--only', 'openclaw', '--non-interactive', '--no-mcp-shrink', '--config-dir', dir], {
+      env: { ...process.env, OPENCLAW_WORKSPACE: ws, NO_COLOR: '1' },
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1, `unsafe openclaw target should fail: ${r.stderr || r.stdout}`);
+    assert.match(r.stderr, /unsafe target/);
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'outside stays unchanged\n');
+    assert.equal(fs.existsSync(path.join(ws, 'SOUL.md')), false, 'SOUL.md should not be written after unsafe target');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('openclaw install refuses symlinked skill parent directories', (t) => {
+  const dir = freshTmpDir();
+  const ws = path.join(dir, 'ws');
+  const outsideSkills = path.join(dir, 'outside-skills');
+  fs.mkdirSync(ws, { recursive: true });
+  fs.mkdirSync(outsideSkills);
+  try {
+    fs.symlinkSync(outsideSkills, path.join(ws, 'skills'));
+  } catch (e) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (isSymlinkSetupUnsupported(e)) {
+      t.skip(`symlink setup unsupported on this runner: ${e.code}`);
+      return;
+    }
+    throw e;
+  }
+  try {
+    const r = spawnSync('node', [INSTALLER, '--only', 'openclaw', '--non-interactive', '--no-mcp-shrink', '--config-dir', dir], {
+      env: { ...process.env, OPENCLAW_WORKSPACE: ws, NO_COLOR: '1' },
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1, `unsafe openclaw parent should fail: ${r.stderr || r.stdout}`);
+    assert.match(r.stderr, /unsafe target/);
+    assert.equal(fs.existsSync(path.join(outsideSkills, 'caveman', 'SKILL.md')), false, 'skill should not be written through parent symlink');
+    assert.equal(fs.existsSync(path.join(ws, 'SOUL.md')), false, 'SOUL.md should not be written after unsafe parent');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('openclaw install preserves user content in SOUL.md (append, not overwrite)', () => {
   const dir = freshTmpDir();
   const ws = path.join(dir, 'ws');
@@ -370,6 +436,137 @@ test('caveman-init.js --only openclaw routes through the same helper', () => {
     assert.ok(fs.existsSync(path.join(ws, 'SOUL.md')), 'SOUL.md missing via init route');
     const soulRaw = fs.readFileSync(path.join(ws, 'SOUL.md'), 'utf8');
     assert.match(soulRaw, /Respond terse like smart caveman/, 'sentinel missing via init route');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('nullclaw install writes always-on skill into isolated workspace', () => {
+  const dir = freshTmpDir();
+  const ws = path.join(dir, 'null-ws');
+  fs.mkdirSync(ws);
+  try {
+    const r = spawnSync('node', [INSTALLER, '--only', 'nullclaw', '--non-interactive', '--no-mcp-shrink', '--config-dir', dir], {
+      env: { ...process.env, NULLCLAW_WORKSPACE: ws, NO_COLOR: '1' },
+      encoding: 'utf8',
+    });
+    assert.notEqual(r.status, 2, `installer aborted on argv parse: ${r.stderr}`);
+    assert.equal(r.status, 0, `nullclaw install failed: ${r.stderr || r.stdout}`);
+
+    const skillFile = path.join(ws, 'skills', 'caveman', 'SKILL.md');
+    assert.ok(fs.existsSync(skillFile), 'NullClaw skill SKILL.md missing');
+    const raw = fs.readFileSync(skillFile, 'utf8');
+    assert.match(raw, /^---\n/, 'skill missing frontmatter');
+    assert.match(raw, /\nname:\s*caveman/, 'skill missing name frontmatter');
+    assert.match(raw, /\nalways:\s*true/, 'skill missing always: true frontmatter');
+    assert.match(raw, /Respond terse like smart caveman/, 'skill missing caveman instructions');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('nullclaw install is idempotent and uninstall removes only skill folder', () => {
+  const dir = freshTmpDir();
+  const ws = path.join(dir, 'null-ws');
+  fs.mkdirSync(ws);
+  fs.writeFileSync(path.join(ws, 'SOUL.md'), '# user soul\n');
+  try {
+    const env = { ...process.env, NULLCLAW_WORKSPACE: ws, NO_COLOR: '1' };
+    const args = ['--only', 'nullclaw', '--non-interactive', '--no-mcp-shrink', '--config-dir', dir];
+    const first = spawnSync('node', [INSTALLER, ...args], { env, encoding: 'utf8' });
+    assert.equal(first.status, 0, `first nullclaw install failed: ${first.stderr || first.stdout}`);
+    const second = spawnSync('node', [INSTALLER, ...args], { env, encoding: 'utf8' });
+    assert.equal(second.status, 0, `second nullclaw install failed: ${second.stderr || second.stdout}`);
+
+    const skillRaw = fs.readFileSync(path.join(ws, 'skills', 'caveman', 'SKILL.md'), 'utf8');
+    const alwaysMatches = skillRaw.match(/^always:/gm) || [];
+    assert.equal(alwaysMatches.length, 1, `expected 1 always key after re-run, got ${alwaysMatches.length}`);
+
+    const cleanPath = pathWithout(['claude', 'gemini']);
+    const r = spawnSync('node', [INSTALLER, '--uninstall', '--non-interactive', '--no-mcp-shrink', '--config-dir', dir], {
+      env: { ...env, PATH: cleanPath },
+      encoding: 'utf8',
+    });
+    assert.notEqual(r.status, 2, `uninstall argv error: ${r.stderr}`);
+    assert.equal(fs.existsSync(path.join(ws, 'skills', 'caveman')), false, 'NullClaw skill folder should be removed');
+    assert.equal(fs.readFileSync(path.join(ws, 'SOUL.md'), 'utf8'), '# user soul\n', 'NullClaw SOUL.md should be preserved');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('nullclaw install refuses symlinked skill file targets', (t) => {
+  const dir = freshTmpDir();
+  const ws = path.join(dir, 'null-ws');
+  const skillDir = path.join(ws, 'skills', 'caveman');
+  const outside = path.join(dir, 'outside-null-skill.md');
+  fs.mkdirSync(skillDir, { recursive: true });
+  fs.writeFileSync(outside, 'outside stays unchanged\n');
+  try {
+    fs.symlinkSync(outside, path.join(skillDir, 'SKILL.md'));
+  } catch (e) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (isSymlinkSetupUnsupported(e)) {
+      t.skip(`symlink setup unsupported on this runner: ${e.code}`);
+      return;
+    }
+    throw e;
+  }
+  try {
+    const r = spawnSync('node', [INSTALLER, '--only', 'nullclaw', '--non-interactive', '--no-mcp-shrink', '--config-dir', dir], {
+      env: { ...process.env, NULLCLAW_WORKSPACE: ws, NO_COLOR: '1' },
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1, `unsafe nullclaw target should fail: ${r.stderr || r.stdout}`);
+    assert.match(r.stderr, /unsafe target/);
+    assert.equal(fs.readFileSync(outside, 'utf8'), 'outside stays unchanged\n');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('nullclaw install refuses symlinked skill parent directories', (t) => {
+  const dir = freshTmpDir();
+  const ws = path.join(dir, 'null-ws');
+  const outsideSkills = path.join(dir, 'outside-null-skills');
+  fs.mkdirSync(ws, { recursive: true });
+  fs.mkdirSync(outsideSkills);
+  try {
+    fs.symlinkSync(outsideSkills, path.join(ws, 'skills'));
+  } catch (e) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (isSymlinkSetupUnsupported(e)) {
+      t.skip(`symlink setup unsupported on this runner: ${e.code}`);
+      return;
+    }
+    throw e;
+  }
+  try {
+    const r = spawnSync('node', [INSTALLER, '--only', 'nullclaw', '--non-interactive', '--no-mcp-shrink', '--config-dir', dir], {
+      env: { ...process.env, NULLCLAW_WORKSPACE: ws, NO_COLOR: '1' },
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 1, `unsafe nullclaw parent should fail: ${r.stderr || r.stdout}`);
+    assert.match(r.stderr, /unsafe target/);
+    assert.equal(fs.existsSync(path.join(outsideSkills, 'caveman', 'SKILL.md')), false, 'skill should not be written through parent symlink');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('caveman-init.js --only nullclaw routes through the same helper', () => {
+  const dir = freshTmpDir();
+  const ws = path.join(dir, 'null-ws');
+  fs.mkdirSync(ws);
+  try {
+    const initScript = path.join(REPO_ROOT, 'src', 'tools', 'caveman-init.js');
+    const r = spawnSync('node', [initScript, dir, '--only', 'nullclaw'], {
+      env: { ...process.env, NULLCLAW_WORKSPACE: ws, NO_COLOR: '1' },
+      encoding: 'utf8',
+    });
+    assert.equal(r.status, 0, `caveman-init failed: ${r.stderr || r.stdout}`);
+    const raw = fs.readFileSync(path.join(ws, 'skills', 'caveman', 'SKILL.md'), 'utf8');
+    assert.match(raw, /\nalways:\s*true/, 'NullClaw skill missing always frontmatter via init route');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
