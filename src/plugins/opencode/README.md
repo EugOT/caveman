@@ -1,7 +1,8 @@
 # caveman — opencode plugin
 
 Native opencode plugin. Mirrors the Claude Code hook architecture using
-opencode's `session.created` + `tui.prompt.append` lifecycle hooks.
+opencode's `event`, `chat.message`, and
+`experimental.chat.system.transform` plugin hooks.
 
 ## What this ships
 
@@ -19,15 +20,17 @@ to `caveman-config.cjs` because this directory is `"type": "module"`) into
 
 ## What it does
 
-- `session.created` → writes the configured default mode to
+- `event` → handles `event.type === "session.created"` and writes the
+  configured default mode to
   `~/.config/opencode/.caveman-active` via the same `safeWriteFlag` helper
   Claude Code uses (O_NOFOLLOW, atomic temp+rename, 0600 perms, symlink
   refusal, ownership check).
-- `tui.prompt.append` → flips the flag in response to `/caveman[ <level>]`,
+- `chat.message` → flips the flag in response to `/caveman[ <level>]`,
   `/caveman-commit`, `/caveman-review`, `/caveman-compress`, and natural
-  language ("turn on caveman", "stop caveman", "normal mode"). When a
-  non-independent mode is active, appends a one-line reinforcement to keep
-  caveman in the model's attention each turn.
+  language ("turn on caveman", "stop caveman", "normal mode").
+- `experimental.chat.system.transform` → when a non-independent mode is active,
+  appends a one-line reinforcement to keep caveman in the model's attention
+  each turn.
 
 ## What it does NOT do
 

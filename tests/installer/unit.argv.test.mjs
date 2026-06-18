@@ -36,6 +36,7 @@ test('--list prints provider matrix', () => {
   assert.match(r.stdout, /antigravity\b.*\(soft\)/);
   assert.match(r.stdout, /codex-app\/codex-cli/);
   assert.match(r.stdout, /warpPreview\/warp-preview/);
+  assert.match(r.stdout, /Repo-only init ids: .*perplexity/);
 });
 
 test('unknown flag exits 2 with error', () => {
@@ -85,6 +86,16 @@ test('repo-only harness ids require --with-init or --all', () => {
   const r = run('--dry-run', '--only', 'pi', '--non-interactive', '--config-dir', '/tmp/__cm_pi_no_init');
   assert.equal(r.status, 2);
   assert.match(r.stderr, /pi is a repo-local init target/);
+});
+
+test('perplexity is accepted only as a universal repo-local init target', () => {
+  const noInit = run('--dry-run', '--only', 'perplexity', '--non-interactive', '--config-dir', '/tmp/__cm_perplexity_no_init');
+  assert.equal(noInit.status, 2);
+  assert.match(noInit.stderr, /perplexity is a repo-local init target/);
+
+  const withInit = run('--dry-run', '--with-init', '--only', 'perplexity', '--non-interactive', '--config-dir', '/tmp/__cm_perplexity_init');
+  assert.equal(withInit.status, 0);
+  assert.match(withInit.stdout, /would run: .*caveman-init\.js .* --only perplexity/);
 });
 
 test('repo-only harness ids are forwarded to caveman-init with --with-init', () => {
