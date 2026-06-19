@@ -8,6 +8,13 @@ pub fn build(b: *std.Build) void {
 
     const tool = b.option([]const u8, "tool", "caveman | ponytail") orelse "caveman";
 
+    // Reject typos at configure time — an unknown -Dtool would silently build a
+    // binary with a broken command prefix and flag filename.
+    if (!std.mem.eql(u8, tool, "caveman") and !std.mem.eql(u8, tool, "ponytail")) {
+        std.debug.print("error: -Dtool must be 'caveman' or 'ponytail', got '{s}'\n", .{tool});
+        std.process.exit(1);
+    }
+
     const opts = b.addOptions();
     opts.addOption([]const u8, "tool", tool);
 

@@ -12,3 +12,6 @@ context/refs/research-brief-caveman-code-efficiency.md
 # Build artifacts
 dist/*
 !dist/caveman.skill
+
+zig/.zig-cache/
+zig/zig-out/
