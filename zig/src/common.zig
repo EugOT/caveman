@@ -376,10 +376,115 @@ pub fn writeStdout(bytes: []const u8) void {
     }
 }
 
+/// Current wall-clock time in milliseconds since the Unix epoch via libc
+/// gettimeofday(2) — the C-ABI equivalent of JS Date.now(). std.time has moved
+/// to the Io surface in this 0.16 build, so we route through libc to stay on
+/// the stable C ABI like the rest of these hooks. Returns 0 on failure.
+pub fn nowMillis() i64 {
+    var tv: c.timeval = undefined;
+    if (c.gettimeofday(&tv, null) != 0) return 0;
+    const sec: i64 = @intCast(tv.sec);
+    const usec: i64 = @intCast(tv.usec);
+    return sec * 1000 + @divTrunc(usec, 1000);
+}
+
+pub fn writeStderr(bytes: []const u8) void {
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const n = c.write(2, bytes.ptr + written, bytes.len - written);
+        if (n <= 0) return;
+        written += @intCast(n);
+    }
+}
+
 pub fn unlinkFlag(path: []const u8) void {
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const pz = toZ(&pbuf, path) catch return;
     _ = c.unlink(pz);
+}
+
+/// Pre-rendered savings-suffix path under the Claude config dir.
+pub fn statuslineSuffixPath(gpa: std.mem.Allocator) FlagError![]u8 {
+    return claudeConfigFile(gpa, STATUSLINE_SUFFIX_NAME);
+}
+
+/// Lifetime stats log filename ($CLAUDE_CONFIG_DIR/.<tool>-history.jsonl).
+pub const HISTORY_NAME = "." ++ TOOL ++ "-history.jsonl";
+
+/// Resolve the lifetime history JSONL path.
+pub fn historyPath(gpa: std.mem.Allocator) FlagError![]u8 {
+    return claudeConfigFile(gpa, HISTORY_NAME);
+}
+
+/// Symlink-safe append to the history JSONL. Mirrors caveman-config.js
+/// appendFlag: O_APPEND|O_CREAT|O_NOFOLLOW, mode 0600, refuse-on-symlink for
+/// both the target file and any ancestor of its parent, ensure parent exists,
+/// and normalize the trailing newline (strip then add exactly one). Best-effort:
+/// silent-fails on every filesystem error — history is never load-bearing.
+pub fn appendHistory(path: []const u8, line: []const u8) void {
+    if (isSymlink(path)) return;
+    const dir = std.fs.path.dirname(path) orelse ".";
+    if (ancestorUnsafe(dir)) return;
+
+    {
+        var dbuf: [std.fs.max_path_bytes]u8 = undefined;
+        if (toZ(&dbuf, dir)) |dz| {
+            _ = c.mkdir(dz, 0o700);
+        } else |_| {}
+    }
+
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const pz = toZ(&pbuf, path) catch return;
+
+    const flags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .NOFOLLOW = true };
+    const fd = c.open(pz, flags, @as(c.mode_t, 0o600));
+    if (fd < 0) return;
+    defer _ = close(fd);
+
+    // Mirror JS: String(line).replace(/\n$/, '') + '\n' — strip a single
+    // trailing newline, then write the line plus exactly one newline.
+    const body = if (line.len > 0 and line[line.len - 1] == '\n') line[0 .. line.len - 1] else line;
+    var written: usize = 0;
+    while (written < body.len) {
+        const n = c.write(fd, body.ptr + written, body.len - written);
+        if (n <= 0) return;
+        written += @intCast(n);
+    }
+    const nl = "\n";
+    _ = c.write(fd, nl.ptr, 1);
+}
+
+/// Symlink-safe history read. Returns the whole file as an owned buffer or null.
+/// Mirrors caveman-config.js readHistory: refuse symlinks / non-regular files,
+/// no size cap (history grows with use). Caller splits + parses lines.
+pub fn readHistoryFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+    if (isSymlink(path)) return null;
+    if (!isRegularFileNoSymlink(path)) return null;
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const pz = toZ(&pbuf, path) catch return null;
+    const flags: c.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true };
+    const fd = c.open(pz, flags, @as(c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = close(fd);
+
+    var out: std.ArrayList(u8) = .empty;
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = c.read(fd, &buf, buf.len);
+        if (n < 0) {
+            out.deinit(gpa);
+            return null;
+        }
+        if (n == 0) break;
+        out.appendSlice(gpa, buf[0..@intCast(n)]) catch {
+            out.deinit(gpa);
+            return null;
+        };
+    }
+    return out.toOwnedSlice(gpa) catch {
+        out.deinit(gpa);
+        return null;
+    };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

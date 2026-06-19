@@ -6,9 +6,10 @@ const std = @import("std");
 //   caveman-hook        — UserPromptSubmit  (src/main.zig)
 //   caveman-activate    — SessionStart      (src/activate.zig)
 //   caveman-statusline  — statusline badge  (src/statusline.zig)
+//   caveman-stats       — /caveman-stats    (src/stats.zig)
 //
-// All three share src/common.zig (TOOL identity, mode whitelist, config
-// resolution, the symlink-safe flag write).
+// All four share src/common.zig (TOOL identity, mode whitelist, config
+// resolution, the symlink-safe flag write, history append/read).
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -34,11 +35,14 @@ pub fn build(b: *std.Build) void {
         .{ .suffix = "hook", .src = "src/main.zig" },
         .{ .suffix = "activate", .src = "src/activate.zig" },
         .{ .suffix = "statusline", .src = "src/statusline.zig" },
+        .{ .suffix = "stats", .src = "src/stats.zig" },
     };
 
-    // The UserPromptSubmit hook keeps the `run` step (it reads stdin), matching
-    // the original build. The other two are install-only artifacts.
+    // The UserPromptSubmit hook keeps the `run` step (it reads stdin); the stats
+    // binary gets its own `run-stats` step (it takes --session-file args, used
+    // by the differential check). activate / statusline are install-only.
     var hook_exe: ?*std.Build.Step.Compile = null;
+    var stats_exe: ?*std.Build.Step.Compile = null;
 
     for (bins) |bin| {
         const exe = b.addExecutable(.{
@@ -53,12 +57,18 @@ pub fn build(b: *std.Build) void {
         exe.root_module.link_libc = true;
         b.installArtifact(exe);
         if (std.mem.eql(u8, bin.suffix, "hook")) hook_exe = exe;
+        if (std.mem.eql(u8, bin.suffix, "stats")) stats_exe = exe;
     }
 
     const run_step = b.step("run", "Run the UserPromptSubmit hook");
     const run = b.addRunArtifact(hook_exe.?);
     if (b.args) |args| run.addArgs(args);
     run_step.dependOn(&run.step);
+
+    const run_stats_step = b.step("run-stats", "Run the caveman-stats binary");
+    const run_stats = b.addRunArtifact(stats_exe.?);
+    if (b.args) |args| run_stats.addArgs(args);
+    run_stats_step.dependOn(&run_stats.step);
 
     // ── Tests ───────────────────────────────────────────────────────────────
     // One test artifact per source root; the `test` step runs them all. Each
