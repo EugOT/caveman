@@ -6,6 +6,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -108,6 +110,32 @@ test('agents init target is forwarded with --with-init', () => {
   const r = run('--dry-run', '--with-init', '--only', 'agents', '--non-interactive', '--config-dir', '/tmp/__cm_agents_init');
   assert.equal(r.status, 0);
   assert.match(r.stdout, /would run: .*caveman-init\.js .* --only agents/);
+});
+
+test('detached single-file --with-init fails closed', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-detached-init-'));
+  try {
+    const copiedBin = path.join(tmp, 'bin');
+    fs.cpSync(path.resolve(HERE, '..', '..', 'bin'), copiedBin, { recursive: true });
+    const r = spawnSync(
+      'node',
+      [
+        path.join(copiedBin, 'install.js'),
+        '--dry-run',
+        '--with-init',
+        '--only',
+        'agents',
+        '--non-interactive',
+        '--config-dir',
+        path.join(tmp, 'config'),
+      ],
+      { encoding: 'utf8', cwd: tmp },
+    );
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /detached single-file --with-init/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test('claw init-only id is forwarded with --with-init', () => {

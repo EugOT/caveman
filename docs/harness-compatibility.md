@@ -21,7 +21,7 @@ Claude-compatible harnesses also get `CLAUDE.md` with an `@AGENTS.md` import, be
 | Codex CLI / Codex app | `skills` profile plus repo-local `AGENTS.md`, `.agents/skills/caveman/SKILL.md`, `.codex/skills/caveman/SKILL.md` |
 | opencode | Native plugin and global opencode files; repo-local `AGENTS.md` and `.agents/skills/caveman/SKILL.md` via `--with-init` |
 | Warp / Warp Preview | `skills` profile plus repo-local `AGENTS.md` and `.agents/skills/caveman/SKILL.md` |
-| OpenClaw | Workspace skill and `SOUL.md`; repo-local `AGENTS.md` and `.agents/skills/caveman/SKILL.md` via `--with-init` |
+| OpenClaw | Native `--only openclaw` writes only the workspace skill and `SOUL.md`; `--with-init --only openclaw` also writes repo-local `AGENTS.md` and `.agents/skills/caveman/SKILL.md` |
 | NullClaw | Workspace skill with `always: true`; repo-local `AGENTS.md` and `.agents/skills/caveman/SKILL.md` via `--with-init` |
 | Pi | `AGENTS.md`, `.agents/skills/caveman/SKILL.md`, `.pi/skills/caveman/SKILL.md` |
 | pz | `AGENTS.md`, `.agents/skills/caveman/SKILL.md`, `.pz/skills/caveman/SKILL.md` |
@@ -34,4 +34,4 @@ Claude-compatible harnesses also get `CLAUDE.md` with an `@AGENTS.md` import, be
 - [AGENTS.md](https://agents.md/): open Markdown format for repository instructions, no required fields, closest file wins.
 - [Claude Code memory](https://code.claude.com/docs/en/memory): `CLAUDE.md` is the primary memory file; import `@AGENTS.md` to share one source of truth.
 - [Warp rules](https://docs.warp.dev/agent-platform/capabilities/rules/) and [Warp skills](https://docs.warp.dev/agent-platform/capabilities/skills/): project rules default to uppercase `AGENTS.md`; project skills can live in `.agents/skills/`.
-- [opencode rules](https://opencode.ai/docs/rules/) and [opencode plugins](https://opencode.ai/docs/plugins/): project rules use `AGENTS.md`; caveman's native plugin uses the current `event`, `chat.message`, and `experimental.chat.system.transform` hook surfaces.
+- [opencode rules](https://opencode.ai/docs/rules/) and [opencode plugins](https://opencode.ai/docs/plugins/): project rules use `AGENTS.md`; plugins load from project/global plugin directories and expose the `event` dispatcher. Caveman's `chat.message` and `experimental.chat.system.transform` hooks are guarded by installer tests.

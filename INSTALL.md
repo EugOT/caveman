@@ -80,7 +80,7 @@ If you want to install for one agent (or want to know exactly what command runs 
 
 For "auto-activates? No" agents, type `/caveman` once per session (or use natural-language triggers like "talk like caveman", "caveman mode").
 
-Repo-local harness aliases without a stable native installer use `--with-init`: `claude-desktop`, `perplexity`, `zeroclaw`, `goclaw`, `hermes`, `pi`, `pz`, `walcode`, `walkode`, and `claw`. Every explicit repo-local alias writes the universal `AGENTS.md` + `.agents/skills/caveman/SKILL.md` contract first, then adds known compatibility files (`CLAUDE.md` importing `@AGENTS.md`, `.pi/skills/`, `.pz/skills/`, `.claw/instructions.md`, `.codex/skills/`, or `.claude/skills/`). The installer refuses to follow existing symlink targets. See [harness compatibility](docs/harness-compatibility.md) for the native-vs-universal support matrix.
+Repo-local init aliases use `--with-init`: `agents`, `claude-desktop`, `perplexity`, `zeroclaw`, `goclaw`, `hermes`, `pi`, `pz`, `walcode`, `walkode`, and `claw`. Every explicit repo-local alias writes the universal `AGENTS.md` + `.agents/skills/caveman/SKILL.md` contract first, then adds known compatibility files (`CLAUDE.md` importing `@AGENTS.md`, `.pi/skills/`, `.pz/skills/`, `.claw/instructions.md`, `.codex/skills/`, or `.claude/skills/`). The installer refuses to follow existing symlink targets. See [harness compatibility](docs/harness-compatibility.md) for the native-vs-universal support matrix.
 
 **Finding a profile slug for `npx skills add ... -a <profile>`?** Either read the table above, or print the live matrix from the installer:
 
@@ -158,6 +158,7 @@ node bin/install.js --with-init --only pi
 node bin/install.js --with-init --only pz
 node bin/install.js --with-init --only walcode   # also works for walkode/claw
 node bin/install.js --with-init --only claude-desktop
+node bin/install.js --with-init --only agents     # universal AGENTS.md/.agents skill only
 node bin/install.js --with-init --only perplexity # universal AGENTS.md/.agents skill only
 ```
 

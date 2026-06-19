@@ -6,9 +6,10 @@
 //   node src/tools/caveman-init.js [target-dir] [--dry-run] [--force] [--only <agent>]
 //   curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/src/tools/caveman-init.js | node - [args]
 //
-// Without args, runs in cwd. Generates the rule files for Cursor, Windsurf,
-// Cline, Copilot, and AGENTS.md. Does NOT modify CLAUDE.md or compress
-// existing memory files — that's the job of `/caveman:compress`.
+// Without args, runs in cwd. Generates the default rule files for Cursor,
+// Windsurf, Cline, Copilot, opencode, and AGENTS.md. Explicit Claude-compatible
+// aliases may also add a CLAUDE.md import bridge. Does not compress existing
+// memory files — that's the job of `/caveman:compress`.
 
 const fs = require("fs");
 const path = require("path");

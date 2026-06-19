@@ -1596,25 +1596,14 @@ async function runInit(ctx) {
 		const r = runSpawn(absoluteNodePath(), [local, ...args], null, opts.dryRun);
 		return (r.status || 0) === 0;
 	}
-	// Curl-pipe fallback
-	if (opts.dryRun) {
-		note(`  would download ${INIT_SCRIPT_URL} and run it on ${process.cwd()}`);
-		return true;
-	}
-	try {
-		const tmp = path.join(os.tmpdir(), `caveman-init-${process.pid}.js`);
-		await downloadTo(INIT_SCRIPT_URL, tmp);
-		const r = child_process.spawnSync(absoluteNodePath(), [tmp, ...args], {
-			stdio: "inherit",
-		});
-		try {
-			fs.unlinkSync(tmp);
-		} catch (_) {}
-		return (r.status || 0) === 0;
-	} catch (e) {
-		warn("  " + e.message);
-		return false;
-	}
+	warn(
+		"  local src/tools/caveman-init.js not found; refusing detached single-file --with-init",
+	);
+	warn(
+		"  run from a full package/clone so repo-local aliases use the matching init script",
+	);
+	warn(`  skipped remote fallback: ${INIT_SCRIPT_URL}`);
+	return false;
 }
 
 // ── HTTPS download via stdlib ─────────────────────────────────────────────
@@ -2266,6 +2255,12 @@ async function main() {
 	);
 	ctx.note(`  uninstall: npx -y github:${REPO} -- --uninstall`);
 
+	if (
+		ctx.results.failed.length &&
+		!ctx.results.installed.length &&
+		!ctx.results.skipped.length
+	)
+		return 1;
 	// Exit code: nonzero only if every detected agent failed
 	if (
 		ctx.results.detected > 0 &&
