@@ -44,7 +44,7 @@ If you want to install for one agent (or want to know exactly what command runs 
 | **opencode** | `node bin/install.js --only opencode` *(or `npx -y github:JuliusBrussee/caveman -- --only opencode`)* | Yes (plugin + AGENTS.md) |
 | **OpenClaw** | `npx -y github:JuliusBrussee/caveman -- --only openclaw` | Yes (workspace skill + SOUL.md) |
 | **NullClaw** | `npx -y github:JuliusBrussee/caveman -- --only nullclaw` | Yes (workspace skill with `always: true`) |
-| **Codex CLI / Codex app** | `npx skills add JuliusBrussee/caveman -a codex` *(aliases: `codex-cli`, `codex-app`)* | Per-session: `/caveman`; add `--with-init` for `AGENTS.md` + `.codex/skills/` |
+| **Codex CLI / Codex app** | `npx skills add JuliusBrussee/caveman -a codex` *(aliases: `codex-cli`, `codex-app`)* | Per-session: `/caveman`; add `--with-init` for `AGENTS.md` + `.agents/skills/` + `.codex/skills/` |
 | **Cursor** | `npx skills add JuliusBrussee/caveman -a cursor` | Per-session by default; `--with-init` for an always-on rule file |
 | **Windsurf** | `npx skills add JuliusBrussee/caveman -a windsurf` | Per-session by default; `--with-init` for an always-on rule file |
 | **Cline** | `npx skills add JuliusBrussee/caveman -a cline` | Per-session by default; `--with-init` for an always-on rule file |
@@ -69,8 +69,8 @@ If you want to install for one agent (or want to know exactly what command runs 
 | **Atlassian Rovo Dev** | `npx skills add JuliusBrussee/caveman -a rovodev` | No |
 | **Tabnine CLI** | `npx skills add JuliusBrussee/caveman -a tabnine-cli` | No |
 | **Trae** | `npx skills add JuliusBrussee/caveman -a trae` | No |
-| **Warp** | `npx skills add JuliusBrussee/caveman -a warp` | No |
-| **Warp Preview** | `node bin/install.js --only warpPreview` *(alias of `warp`)* | No |
+| **Warp** | `npx skills add JuliusBrussee/caveman -a warp` | No; add `--with-init` for `AGENTS.md` + `.agents/skills/` |
+| **Warp Preview** | `node bin/install.js --only warpPreview` *(alias of `warp`)* | No; add `--with-init` for `AGENTS.md` + `.agents/skills/` |
 | **Replit Agent** | `npx skills add JuliusBrussee/caveman -a replit` | No |
 | **JetBrains Junie** *(soft probe)* | `npx skills add JuliusBrussee/caveman -a junie` | No |
 | **Qoder** *(soft probe)* | `npx skills add JuliusBrussee/caveman -a qoder` | No |
@@ -80,7 +80,7 @@ If you want to install for one agent (or want to know exactly what command runs 
 
 For "auto-activates? No" agents, type `/caveman` once per session (or use natural-language triggers like "talk like caveman", "caveman mode").
 
-Repo-local harness aliases without a stable `skills` profile use `--with-init`: `claude-desktop`, `zeroclaw`, `goclaw`, `hermes`, `pi`, `pz`, `walcode`, `walkode`, and `claw`. These write only the context/skill files those harnesses can read (`AGENTS.md`, `.pi/skills/`, `.pz/skills/`, `.claw/instructions.md`, `.codex/skills/`, or `.claude/skills/`), and the installer refuses to follow existing symlink targets.
+Repo-local init aliases use `--with-init`: `agents`, `claude-desktop`, `perplexity`, `zeroclaw`, `goclaw`, `hermes`, `pi`, `pz`, `walcode`, `walkode`, and `claw`. Every explicit repo-local alias writes the universal `AGENTS.md` + `.agents/skills/caveman/SKILL.md` contract first, then adds known compatibility files (`CLAUDE.md` importing `@AGENTS.md`, `.pi/skills/`, `.pz/skills/`, `.claw/instructions.md`, `.codex/skills/`, or `.claude/skills/`). The installer refuses to follow existing symlink targets. See [harness compatibility](docs/harness-compatibility.md) for the native-vs-universal support matrix.
 
 **Finding a profile slug for `npx skills add ... -a <profile>`?** Either read the table above, or print the live matrix from the installer:
 
@@ -122,7 +122,7 @@ Useful flags:
 | `--minimal` | Plugin / extension only. No hooks, no MCP shrink, no per-repo rules. |
 | `--only <id>` | One agent only. Repeatable: `--only claude --only cursor`. |
 | `--dry-run` | Print every command. Write nothing. |
-| `--with-init` | Drop always-on rule files into the current repo (`.cursor/`, `.windsurf/`, `.clinerules/`, `.github/copilot-instructions.md`, `.opencode/AGENTS.md`, `AGENTS.md`) and, if OpenClaw is on the box, append the bootstrap block to `~/.openclaw/workspace/SOUL.md`. With explicit aliases it can also write repo-local skill/context targets such as `.codex/skills/`, `.claude/skills/`, `.pi/skills/`, `.pz/skills/`, and `.claw/instructions.md`. |
+| `--with-init` | Drop always-on rule files into the current repo (`.cursor/`, `.windsurf/`, `.clinerules/`, `.github/copilot-instructions.md`, `.opencode/AGENTS.md`, `AGENTS.md`) and, if OpenClaw is on the box, append the bootstrap block to `~/.openclaw/workspace/SOUL.md`. With explicit aliases it also writes the universal `.agents/skills/caveman/SKILL.md` project skill and repo-local compatibility targets such as `CLAUDE.md`, `.codex/skills/`, `.claude/skills/`, `.pi/skills/`, `.pz/skills/`, and `.claw/instructions.md`. |
 | `--with-mcp-shrink="<upstream cmd>"` | Register `caveman-shrink` MCP proxy wrapping the given upstream MCP server. **Off by default.** A value is required — caveman-shrink is a proxy and exits immediately without one. Example: `--with-mcp-shrink="npx @modelcontextprotocol/server-filesystem /tmp"`. The value is split on whitespace; for paths-with-spaces, install via `node bin/install.js` from a clone or edit `~/.claude.json` after a stub install. |
 | `--no-mcp-shrink` | Skip MCP-shrink registration. (Default.) |
 | `--with-hooks` / `--no-hooks` | Force-on or force-off the Claude Code hook installer. (Default: on.) |
@@ -158,6 +158,8 @@ node bin/install.js --with-init --only pi
 node bin/install.js --with-init --only pz
 node bin/install.js --with-init --only walcode   # also works for walkode/claw
 node bin/install.js --with-init --only claude-desktop
+node bin/install.js --with-init --only agents     # universal AGENTS.md/.agents skill only
+node bin/install.js --with-init --only perplexity # universal AGENTS.md/.agents skill only
 ```
 
 ## Verify

@@ -95,14 +95,14 @@ caveman/
 | `agents/cavecrew-investigator.md` | Read-only locator subagent (haiku). Output contract: `path:line — symbol — note`. |
 | `agents/cavecrew-builder.md` | Surgical 1-2 file editor subagent. Refuses 3+ file scope. |
 | `agents/cavecrew-reviewer.md` | Diff/file reviewer subagent (haiku). One-line findings with severity emoji. |
-| `src/plugins/opencode/plugin.js` | opencode native plugin. ESM Bun module — `session.created` writes flag, `tui.prompt.append` parses slash/natural-language activation and appends per-prompt reinforcement. Reuses `caveman-config.js` via `createRequire`. |
+| `src/plugins/opencode/plugin.js` | opencode native plugin. ESM Bun module — `event` handles `session.created`, `chat.message` parses slash/natural-language activation, and `experimental.chat.system.transform` appends per-turn reinforcement. Reuses `caveman-config.js` via `createRequire`. |
 | `src/plugins/opencode/commands/*.md` | Six opencode slash-command prompt templates (`/caveman`, `/caveman-{commit,review,compress,stats,help}`). |
 
 ### Auto-generated / auto-synced — do not edit directly
 
 We removed the agent-specific dotdir mirrors at the repo root (`.cursor/`, `.windsurf/`, `.clinerules/`, `.github/copilot-instructions.md`, root `caveman/SKILL.md`). They were never read by the installer — only used to self-apply caveman to this repo when a maintainer opened it in Cursor/Windsurf/Cline. Devs who want caveman in their editor while editing this repo should run `npx caveman --with-init` once (writes per-repo rule files from `src/rules/caveman-activate.md` via `src/tools/caveman-init.js`). For per-user installs through the upstream skills CLI, `npx caveman --only <agent>` runs `npx skills add ... -a <profile>`.
 
-A handful of dotdir leftovers (`.junie/`, `.kiro/`, `.roo/`, `.agents/`) still hold a stale `cavecrew/SKILL.md` mirror from before the cleanup. They aren't read by anything in the current install path; remove on sight, no migration needed.
+A handful of dotdir leftovers (`.junie/`, `.kiro/`, `.roo/`) still hold stale `cavecrew/SKILL.md` mirrors from before the cleanup. They aren't read by anything in the current install path; remove on sight, no migration needed. Do not treat `.agents/skills/caveman/SKILL.md` as a stale mirror when `caveman-init --only <alias>` writes it; that file is the current universal project-skill contract.
 
 What's left is the Claude Code plugin distribution (required by the plugin loader) and the release ZIP.
 
@@ -242,19 +242,21 @@ How caveman reaches each agent type:
 | Agent | Mechanism | Auto-activates? |
 |-------|-----------|----------------|
 | Claude Code | Plugin (hooks + skills) or standalone hooks | Yes — SessionStart hook injects rules |
-| Codex | `npx skills add JuliusBrussee/caveman -a codex` (`codex-cli` / `codex-app` aliases), plus `AGENTS.md` + `.codex/skills/` via `--with-init` | Per-session by default; explicit `--with-init` for repo rules |
+| Codex | `npx skills add JuliusBrussee/caveman -a codex` (`codex-cli` / `codex-app` aliases), plus `AGENTS.md` + `.agents/skills/` + `.codex/skills/` via `--with-init` | Per-session by default; explicit `--with-init` for repo rules |
 | Gemini CLI | Extension with `GEMINI.md` context file | Yes — context file loads every session |
-| opencode | Native plugin (`src/plugins/opencode/`) copied into `~/.config/opencode/plugins/caveman/` + `AGENTS.md` ruleset + skills/agents/commands directories. Plugin uses `session.created` and `tui.prompt.append` lifecycle hooks. No statusline (opencode TUI exposes no plugin-writable badge). | Yes — `session.created` writes flag, `AGENTS.md` carries always-on ruleset |
+| opencode | Native plugin (`src/plugins/opencode/`) copied into `~/.config/opencode/plugins/caveman/` + `AGENTS.md` ruleset + skills/agents/commands directories. Plugin uses `event`, `chat.message`, and `experimental.chat.system.transform` hooks. No statusline (opencode TUI exposes no plugin-writable badge). | Yes — `session.created` events write flag, `AGENTS.md` carries always-on ruleset |
 | OpenClaw | Workspace skill at `~/.openclaw/workspace/skills/caveman/SKILL.md` (frontmatter merged with `version` + `always: true`) plus a marker-fenced bootstrap block in `~/.openclaw/workspace/SOUL.md`. Both writes go through `bin/lib/openclaw.js`; workspace path is overridable via `OPENCLAW_WORKSPACE`. | Yes — SOUL.md is auto-injected each turn under "Project Context" (subject to OpenClaw's 12K-per-file / 60K-total bootstrap caps) |
 | NullClaw | Workspace skill at `$NULLCLAW_WORKSPACE/skills/caveman/SKILL.md`, `$NULLCLAW_HOME/workspace/skills/caveman/SKILL.md`, or `~/.nullclaw/workspace/skills/caveman/SKILL.md` with `version` + `always: true` frontmatter. Writes go through `bin/lib/nullclaw.js`. | Yes — NullClaw treats `always: true` skills as full system-prompt instructions |
 | Cursor | `npx skills add ... -a cursor` (default via `--only cursor`) writes the upstream skill profile; per-repo `.cursor/rules/caveman.mdc` via `--with-init` (calls `src/tools/caveman-init.js`) | Yes — always-on rule |
 | Windsurf | `npx skills add ... -a windsurf` (default via `--only windsurf`); per-repo `.windsurf/rules/caveman.md` via `--with-init` | Yes — always-on rule |
 | Cline | `npx skills add ... -a cline` (default via `--only cline`); per-repo `.clinerules/caveman.md` via `--with-init` | Yes — Cline auto-discovers `.clinerules/` |
 | Copilot | `npx skills add ... -a github-copilot` (soft probe — pass `--only copilot`); per-repo `.github/copilot-instructions.md` + `AGENTS.md` via `--with-init` | Yes — repo-wide instructions |
-| Others (Junie, Trae, Warp, Tabnine, Mistral, Qwen, Devin, Droid, ForgeCode, Bob, Crush, iFlow, OpenHands, Qoder, Rovo Dev, Replit, Antigravity, …) | `npx skills add JuliusBrussee/caveman -a <profile>` | No — user must say `/caveman` each session |
-| Repo-only aliases (claude-desktop, zeroclaw, goclaw, hermes, pi, pz, walcode/walkode/claw) | `node bin/install.js --with-init --only <alias>` writes only the context/skill files that local harnesses read. | Depends on harness context loading |
+| Others (Junie, Trae, Warp, Tabnine, Mistral, Qwen, Devin, Droid, ForgeCode, Bob, Crush, iFlow, OpenHands, Qoder, Rovo Dev, Replit, Antigravity, …) | `npx skills add JuliusBrussee/caveman -a <profile>`; explicit `--with-init` also writes `AGENTS.md` + `.agents/skills/` for AGENTS-aware tools such as Warp | Per-session unless that agent auto-loads project rules |
+| Repo-only aliases (claude-desktop, perplexity, zeroclaw, goclaw, hermes, pi, pz, walcode/walkode/claw) | `node bin/install.js --with-init --only <alias>` writes the universal `AGENTS.md` + `.agents/skills/` contract, then known harness-specific files (`CLAUDE.md`, `.claude/skills/`, `.codex/skills/`, `.pi/skills/`, `.pz/skills/`, `.claw/instructions.md`). | Universal contract; native runtime guarantee only where harness context loading is documented/tested |
 
 opencode reaches Tier 1 minus the statusline (opencode's TUI has no plugin-writable badge). Mode flag lives at `~/.config/opencode/.caveman-active` for any external tooling that wants to surface it.
+
+Universal harness contract lives in [`docs/harness-compatibility.md`](docs/harness-compatibility.md). Keep it honest: `AGENTS.md` + `.agents/skills/` is broad compatibility, not a native provider claim. Perplexity and Hermes stay universal-contract only until a stable loader contract exists.
 
 For agents without hook systems, the always-on snippet lives in `INSTALL.md`'s "Want it always on?" section — keep current with `src/rules/caveman-activate.md`.
 

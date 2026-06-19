@@ -13,6 +13,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -150,7 +151,7 @@ test('all shipped cavecrew agent files become opencode-safe after transform (GRE
 // this fix's scope). The assertion is the same one opencode applies on
 // startup: `tools` must be absent (or an object), never an array.
 test('installer-equivalent copy writes opencode-safe agent file (issue 386 end-to-end)', () => {
-  const tmpDir = fs.mkdtempSync(path.join(REPO_ROOT, 'tests', '.tmp-opencode-agent-'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'caveman-opencode-agent-'));
   try {
     for (const f of SHIPPED_AGENT_FILES) {
       const src = path.join(REPO_ROOT, 'agents', f);

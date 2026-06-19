@@ -6,6 +6,8 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,6 +38,7 @@ test('--list prints provider matrix', () => {
   assert.match(r.stdout, /antigravity\b.*\(soft\)/);
   assert.match(r.stdout, /codex-app\/codex-cli/);
   assert.match(r.stdout, /warpPreview\/warp-preview/);
+  assert.match(r.stdout, /Repo-only init ids: .*perplexity/);
 });
 
 test('unknown flag exits 2 with error', () => {
@@ -87,6 +90,16 @@ test('repo-only harness ids require --with-init or --all', () => {
   assert.match(r.stderr, /pi is a repo-local init target/);
 });
 
+test('perplexity is accepted only as a universal repo-local init target', () => {
+  const noInit = run('--dry-run', '--only', 'perplexity', '--non-interactive', '--config-dir', '/tmp/__cm_perplexity_no_init');
+  assert.equal(noInit.status, 2);
+  assert.match(noInit.stderr, /perplexity is a repo-local init target/);
+
+  const withInit = run('--dry-run', '--with-init', '--only', 'perplexity', '--non-interactive', '--config-dir', '/tmp/__cm_perplexity_init');
+  assert.equal(withInit.status, 0);
+  assert.match(withInit.stdout, /would run: .*caveman-init\.js .* --only perplexity/);
+});
+
 test('repo-only harness ids are forwarded to caveman-init with --with-init', () => {
   const r = run('--dry-run', '--with-init', '--only', 'pi', '--non-interactive', '--config-dir', '/tmp/__cm_pi_init');
   assert.equal(r.status, 0);
@@ -97,6 +110,32 @@ test('agents init target is forwarded with --with-init', () => {
   const r = run('--dry-run', '--with-init', '--only', 'agents', '--non-interactive', '--config-dir', '/tmp/__cm_agents_init');
   assert.equal(r.status, 0);
   assert.match(r.stdout, /would run: .*caveman-init\.js .* --only agents/);
+});
+
+test('detached single-file --with-init fails closed', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cm-detached-init-'));
+  try {
+    const copiedBin = path.join(tmp, 'bin');
+    fs.cpSync(path.resolve(HERE, '..', '..', 'bin'), copiedBin, { recursive: true });
+    const r = spawnSync(
+      'node',
+      [
+        path.join(copiedBin, 'install.js'),
+        '--dry-run',
+        '--with-init',
+        '--only',
+        'agents',
+        '--non-interactive',
+        '--config-dir',
+        path.join(tmp, 'config'),
+      ],
+      { encoding: 'utf8', cwd: tmp },
+    );
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /detached single-file --with-init/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });
 
 test('claw init-only id is forwarded with --with-init', () => {
