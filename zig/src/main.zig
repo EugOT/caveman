@@ -25,6 +25,8 @@ const TOOL = build_options.tool; // "caveman" or "ponytail"
 // libc decls not surfaced under these names in std.c for this dev build.
 extern "c" fn close(fd: c_int) c_int;
 extern "c" fn lstat(path: [*:0]const u8, buf: *c.Stat) c_int;
+// resolved_path must point to a buffer of at least PATH_MAX bytes.
+extern "c" fn realpath(path: [*:0]const u8, resolved_path: [*]u8) ?[*:0]u8;
 
 const VALID_MODES = [_][]const u8{ "lite", "full", "ultra", "wenyan-lite", "wenyan-full", "wenyan-ultra" };
 
@@ -76,12 +78,82 @@ fn isSymlink(path: []const u8) bool {
     return (st.mode & c.S.IFMT) == c.S.IFLNK;
 }
 
+/// lstat; classify a path component as a (real) directory, a symlink, missing,
+/// or other. Used to walk a directory chain refusing any non-directory link.
+const Comp = enum { dir, symlink, missing, other };
+fn classify(path: []const u8) Comp {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = toZ(&buf, path) catch return .symlink; // pathological → treat unsafe
+    var st: c.Stat = undefined;
+    if (lstat(z, &st) != 0) return .missing;
+    const kind = st.mode & c.S.IFMT;
+    if (kind == c.S.IFLNK) return .symlink;
+    if (kind == c.S.IFDIR) return .dir;
+    return .other;
+}
+
+/// realpath a path into `out` (libc realpath(3)); returns the resolved slice or
+/// null on failure. `out` must be >= PATH_MAX.
+fn realpathZ(path: []const u8, out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    var ibuf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = toZ(&ibuf, path) catch return null;
+    const r = realpath(z, out) orelse return null;
+    return std.mem.sliceTo(r, 0);
+}
+
+/// True if reaching `dir` would pass through a symlink an attacker could plant
+/// at ANY level below a trusted base — not just the immediate parent. Mirrors
+/// the JS hooks fs-safe isAnyAncestorSymlink: anchor on the realpath of the
+/// longest trusted base that lexically prefixes `dir` (absorbing benign system
+/// links like /var above the user area), then lstat-walk each tail component,
+/// refusing any symlinked or non-directory ancestor.
+fn ancestorUnsafe(dir: []const u8) bool {
+    const bases: [3]?[]const u8 = .{ getenv("HOME"), getenv("TMPDIR"), getenv("CLAUDE_CONFIG_DIR") };
+
+    var best_base: ?[]const u8 = null;
+    for (bases) |maybe| {
+        const b = maybe orelse continue;
+        if (std.mem.eql(u8, dir, b) or
+            (dir.len > b.len and std.mem.startsWith(u8, dir, b) and dir[b.len] == '/'))
+        {
+            if (best_base == null or b.len > best_base.?.len) best_base = b;
+        }
+    }
+    const base = best_base orelse return true; // outside every trusted base → refuse
+
+    var anchor_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const anchor = realpathZ(base, &anchor_buf) orelse return true;
+
+    const tail = dir[base.len..]; // leading '/' or empty
+    var cur_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (anchor.len >= cur_buf.len) return true;
+    @memcpy(cur_buf[0..anchor.len], anchor);
+    var cur_len = anchor.len;
+
+    var it = std.mem.tokenizeScalar(u8, tail, '/');
+    while (it.next()) |part| {
+        if (cur_len + 1 + part.len >= cur_buf.len) return true;
+        cur_buf[cur_len] = '/';
+        @memcpy(cur_buf[cur_len + 1 ..][0..part.len], part);
+        cur_len += 1 + part.len;
+        const cur = cur_buf[0..cur_len];
+        switch (classify(cur)) {
+            .missing => return false, // tail not created yet → mkdir makes real dirs
+            .symlink, .other => return true,
+            .dir => {},
+        }
+    }
+    return false;
+}
+
 /// Symlink-safe atomic flag write. The security core.
 fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const u8) FlagError!void {
     if (isSymlink(path)) return error.SymlinkRefused;
 
     const dir = std.fs.path.dirname(path) orelse ".";
-    if (isSymlink(dir)) return error.ParentSymlinkRefused;
+    // Refuse if ANY ancestor directory (not just the immediate parent) is a
+    // symlink an attacker could have planted to redirect the open/rename.
+    if (ancestorUnsafe(dir)) return error.ParentSymlinkRefused;
 
     // Ensure parent exists (0700). Ignore errors (already-exists / race).
     {
@@ -304,4 +376,36 @@ test "safeWriteFlag writes mode on clean path" {
 
     var fb: [std.fs.max_path_bytes]u8 = undefined;
     _ = c.unlink(try toZ(&fb, flag));
+}
+
+test "safeWriteFlag refuses symlinked GRANDPARENT (ancestor) dir" {
+    const gpa = std.testing.allocator;
+    const dir_path = try makeTmpDir(gpa);
+    defer gpa.free(dir_path);
+
+    // real/inner is the genuine tree; link -> real is the symlinked grandparent.
+    const real = try std.fs.path.join(gpa, &.{ dir_path, "real" });
+    defer gpa.free(real);
+    const inner = try std.fs.path.join(gpa, &.{ real, "inner" });
+    defer gpa.free(inner);
+    const link = try std.fs.path.join(gpa, &.{ dir_path, "link" });
+    defer gpa.free(link);
+
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    var b3: [std.fs.max_path_bytes]u8 = undefined;
+    _ = c.mkdir(try toZ(&b1, real), 0o700);
+    _ = c.mkdir(try toZ(&b2, inner), 0o700);
+    try std.testing.expect(c.symlink(try toZ(&b1, real), try toZ(&b3, link)) == 0);
+
+    const flag = try std.fs.path.join(gpa, &.{ link, "inner", ".active3" });
+    defer gpa.free(flag);
+
+    try std.testing.expectError(error.ParentSymlinkRefused, safeWriteFlag(gpa, flag, "full"));
+
+    const real_flag = try std.fs.path.join(gpa, &.{ inner, ".active3" });
+    defer gpa.free(real_flag);
+    try std.testing.expect(classify(real_flag) == .missing);
+
+    _ = c.unlink(try toZ(&b3, link));
 }
