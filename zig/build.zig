@@ -1,7 +1,14 @@
 const std = @import("std");
 
-// Build both hook binaries from one source, parameterized by -Dtool.
+// Build all three hook binaries from one source tree, parameterized by -Dtool.
 // Mirrors the real rewrite: one Zig codebase, comptime-selected tool identity.
+//
+//   caveman-hook        — UserPromptSubmit  (src/main.zig)
+//   caveman-activate    — SessionStart      (src/activate.zig)
+//   caveman-statusline  — statusline badge  (src/statusline.zig)
+//
+// All three share src/common.zig (TOOL identity, mode whitelist, config
+// resolution, the symlink-safe flag write).
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -18,33 +25,56 @@ pub fn build(b: *std.Build) void {
     const opts = b.addOptions();
     opts.addOption([]const u8, "tool", tool);
 
-    const exe = b.addExecutable(.{
-        .name = b.fmt("{s}-hook", .{tool}),
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    exe.root_module.addOptions("build_options", opts);
-    exe.root_module.link_libc = true;
-    b.installArtifact(exe);
+    // ── Executables ─────────────────────────────────────────────────────────
+    const Bin = struct {
+        suffix: []const u8, // "hook" | "activate" | "statusline"
+        src: []const u8, // root source file
+    };
+    const bins = [_]Bin{
+        .{ .suffix = "hook", .src = "src/main.zig" },
+        .{ .suffix = "activate", .src = "src/activate.zig" },
+        .{ .suffix = "statusline", .src = "src/statusline.zig" },
+    };
 
-    const run_step = b.step("run", "Run the hook");
-    const run = b.addRunArtifact(exe);
+    // The UserPromptSubmit hook keeps the `run` step (it reads stdin), matching
+    // the original build. The other two are install-only artifacts.
+    var hook_exe: ?*std.Build.Step.Compile = null;
+
+    for (bins) |bin| {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("{s}-{s}", .{ tool, bin.suffix }),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(bin.src),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addOptions("build_options", opts);
+        exe.root_module.link_libc = true;
+        b.installArtifact(exe);
+        if (std.mem.eql(u8, bin.suffix, "hook")) hook_exe = exe;
+    }
+
+    const run_step = b.step("run", "Run the UserPromptSubmit hook");
+    const run = b.addRunArtifact(hook_exe.?);
     if (b.args) |args| run.addArgs(args);
     run_step.dependOn(&run.step);
 
-    // Unit tests
-    const tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    tests.root_module.addOptions("build_options", opts);
-    tests.root_module.link_libc = true;
+    // ── Tests ───────────────────────────────────────────────────────────────
+    // One test artifact per source root; the `test` step runs them all. Each
+    // root pulls in common.zig via refAllDecls, so the shared security core is
+    // exercised regardless of which root is built.
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
+    for (bins) |bin| {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(bin.src),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        t.root_module.addOptions("build_options", opts);
+        t.root_module.link_libc = true;
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
 }
