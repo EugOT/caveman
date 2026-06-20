@@ -251,25 +251,25 @@ pub const AddHookOpts = struct {
 pub fn addCommandHook(arena: std.mem.Allocator, settings: *std.json.Value, event: []const u8, opts: AddHookOpts) !bool {
     if (settings.* != .object) return false;
     if (settings.object.get("hooks") == null or settings.object.get("hooks").? != .object) {
-        try settings.object.put("hooks", .{ .object = std.json.ObjectMap.init(arena) });
+        try settings.object.put(arena, "hooks", .{ .object = .{} });
     }
     const hooks_ptr = settings.object.getPtr("hooks").?;
     if (hooks_ptr.object.get(event) == null or hooks_ptr.object.get(event).? != .array) {
-        try hooks_ptr.object.put(event, .{ .array = std.json.Array.init(arena) });
+        try hooks_ptr.object.put(arena, event, .{ .array = std.json.Array.init(arena) });
     }
     const marker = opts.marker orelse opts.command;
     if (hasCavemanHook(settings, event, marker)) return false;
 
-    var hook = std.json.ObjectMap.init(arena);
-    try hook.put("type", .{ .string = "command" });
-    try hook.put("command", .{ .string = opts.command });
-    if (opts.timeout) |t| try hook.put("timeout", .{ .integer = t });
-    if (opts.status_message) |m| try hook.put("statusMessage", .{ .string = m });
+    var hook: std.json.ObjectMap = .{};
+    try hook.put(arena, "type", .{ .string = "command" });
+    try hook.put(arena, "command", .{ .string = opts.command });
+    if (opts.timeout) |t| try hook.put(arena, "timeout", .{ .integer = t });
+    if (opts.status_message) |m| try hook.put(arena, "statusMessage", .{ .string = m });
 
     var inner = std.json.Array.init(arena);
     try inner.append(.{ .object = hook });
-    var wrapper = std.json.ObjectMap.init(arena);
-    try wrapper.put("hooks", .{ .array = inner });
+    var wrapper: std.json.ObjectMap = .{};
+    try wrapper.put(arena, "hooks", .{ .array = inner });
 
     const arr_ptr = hooks_ptr.object.getPtr(event).?;
     try arr_ptr.array.append(.{ .object = wrapper });
@@ -612,7 +612,7 @@ pub const ParseError = error{ ReadFailed, NotJson } || std.mem.Allocator.Error;
 pub fn parseSettings(arena: std.mem.Allocator, raw: []const u8) !std.json.Value {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) {
-        return .{ .object = std.json.ObjectMap.init(arena) };
+        return .{ .object = .{} };
     }
     if (std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{})) |v| {
         return v;

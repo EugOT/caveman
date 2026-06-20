@@ -257,12 +257,27 @@ fn realpathZ(path: []const u8, out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
 /// longest trusted base that lexically prefixes `dir` (absorbing benign system
 /// links like /var above the user area), then lstat-walk each tail component,
 /// refusing any symlinked or non-directory ancestor.
+/// Strip trailing '/' chars (but keep a lone "/"). Mirrors how path.resolve
+/// normalizes a base before a prefix comparison.
+fn trimTrailingSlash(s: []const u8) []const u8 {
+    var end = s.len;
+    while (end > 1 and s[end - 1] == '/') end -= 1;
+    return s[0..end];
+}
+
 pub fn ancestorUnsafe(dir: []const u8) bool {
     const bases: [3]?[]const u8 = .{ getenv("HOME"), getenv("TMPDIR"), getenv("CLAUDE_CONFIG_DIR") };
 
     var best_base: ?[]const u8 = null;
     for (bases) |maybe| {
-        const b = maybe orelse continue;
+        const raw = maybe orelse continue;
+        // Normalize a trailing slash off the base before the prefix check. A base
+        // like `$TMPDIR` is commonly `/var/.../T/` (trailing slash); without
+        // trimming, `dir[b.len]` lands one char too far and never equals '/', so
+        // a legitimately-under-base dir would be refused. JS normalizes via
+        // path.resolve; we strip the trailing '/' to match.
+        const b = trimTrailingSlash(raw);
+        if (b.len == 0) continue;
         if (std.mem.eql(u8, dir, b) or
             (dir.len > b.len and std.mem.startsWith(u8, dir, b) and dir[b.len] == '/'))
         {
