@@ -33,6 +33,9 @@ pub const STATUSLINE_SUFFIX_NAME = "." ++ TOOL ++ "-statusline-suffix";
 // libc decls not surfaced under these names in std.c for this dev build.
 pub extern "c" fn close(fd: c_int) c_int;
 pub extern "c" fn lstat(path: [*:0]const u8, buf: *c.Stat) c_int;
+pub extern "c" fn stat(path: [*:0]const u8, buf: *c.Stat) c_int; // follows symlinks
+pub extern "c" fn getuid() c.uid_t;
+pub extern "c" fn fchmod(fd: c_int, mode: c.mode_t) c_int;
 pub extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 pub extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 // resolved_path must point to a buffer of at least PATH_MAX bytes.
@@ -286,10 +289,26 @@ pub fn ancestorUnsafe(dir: []const u8) bool {
     }
     const base = best_base orelse return true; // outside every trusted base → refuse
 
+    // Anchor on the realpath of the deepest EXISTING ancestor at/under `base`.
+    // libc realpath(3) returns NULL on a nonexistent final component, so we must
+    // NOT realpath `base` (or `dir`) directly — on first run the config dir does
+    // not exist yet, which previously made this refuse every legitimate write.
+    // Climb up from `base` until realpath succeeds; the components below that
+    // (still nonexistent) are created by mkdir as real dirs, so they are safe.
     var anchor_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const anchor = realpathZ(base, &anchor_buf) orelse return true;
+    var existing = base;
+    const anchor: []const u8 = realpathZ(existing, &anchor_buf) orelse blk: {
+        while (true) {
+            const up = std.fs.path.dirname(existing) orelse return true;
+            if (up.len == existing.len) return true; // reached root, still unresolved
+            existing = up;
+            if (realpathZ(existing, &anchor_buf)) |a| break :blk a;
+        }
+    };
 
-    const tail = dir[base.len..]; // leading '/' or empty
+    // Walk every component from the resolved anchor down to `dir`, lstat-ing each
+    // on the real anchor so an intermediate symlink surfaces as a component.
+    const tail = dir[existing.len..]; // portion of dir below the resolved ancestor
     var cur_buf: [std.fs.max_path_bytes]u8 = undefined;
     if (anchor.len >= cur_buf.len) return true;
     @memcpy(cur_buf[0..anchor.len], anchor);
@@ -311,14 +330,42 @@ pub fn ancestorUnsafe(dir: []const u8) bool {
     return false;
 }
 
-/// Symlink-safe atomic flag write. The security core.
-pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const u8) FlagError!void {
-    if (isSymlink(path)) return error.SymlinkRefused;
+/// Resolve the directory to write into, honoring a symlinked parent the same way
+/// caveman-config.js safeWriteFlag does: a symlinked flag dir is ALLOWED iff its
+/// realpath target is a directory owned by the current uid (the legitimate
+/// `~/.claude`-as-symlink pattern); a symlink to a dir owned by another user, or
+/// to a non-directory, is refused. Returns the real dir (owned slice in `out`),
+/// or null to refuse. Mirrors the JS uid-ownership contract — NOT a recursive
+/// ancestor walk (the JS only checks the immediate parent).
+fn resolveRealFlagDir(dir: []const u8, out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    var lbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dz = toZ(&lbuf, dir) catch return null;
+    var lst: c.Stat = undefined;
+    if (lstat(dz, &lst) != 0) return null; // lstat error → refuse (JS returns)
+    if ((lst.mode & c.S.IFMT) != c.S.IFLNK) {
+        // Not a symlink: write directly into `dir`.
+        if (dir.len >= out.len) return null;
+        @memcpy(out[0..dir.len], dir);
+        return out[0..dir.len];
+    }
+    // Symlinked parent: resolve and verify the target is a uid-owned directory.
+    const real = realpathZ(dir, out) orelse return null;
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const rz = toZ(&rbuf, real) catch return null;
+    var rst: c.Stat = undefined;
+    if (stat(rz, &rst) != 0) return null;
+    if ((rst.mode & c.S.IFMT) != c.S.IFDIR) return null; // target not a dir
+    if (rst.uid != getuid()) return null; // owned by another user → refuse
+    return real;
+}
 
+/// Symlink-safe atomic flag write. Mirrors caveman-config.js safeWriteFlag:
+/// mkdir -p the dir; allow a uid-owned symlinked parent (resolve it); refuse the
+/// leaf flag file being a symlink (the real clobber vector); write a temp with
+/// O_CREAT|O_EXCL|O_NOFOLLOW at 0600, fchmod 0600, atomic rename onto the real
+/// flag path. Silent on all FS errors.
+pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const u8) FlagError!void {
     const dir = std.fs.path.dirname(path) orelse ".";
-    // Refuse if ANY ancestor directory (not just the immediate parent) is a
-    // symlink an attacker could have planted to redirect the open/rename.
-    if (ancestorUnsafe(dir)) return error.ParentSymlinkRefused;
 
     // Ensure parent exists (0700). Ignore errors (already-exists / race).
     {
@@ -328,7 +375,18 @@ pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const 
         } else |_| {}
     }
 
-    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp.{d}", .{ path, c.getpid() });
+    var rdbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_dir = resolveRealFlagDir(dir, &rdbuf) orelse return error.ParentSymlinkRefused;
+
+    // Real flag path = real_dir / basename(path).
+    const base = std.fs.path.basename(path);
+    const real_path = try std.fs.path.join(gpa, &.{ real_dir, base });
+    defer gpa.free(real_path);
+
+    // The flag file itself must never be a symlink (the actual clobber vector).
+    if (isSymlink(real_path)) return error.SymlinkRefused;
+
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp.{d}", .{ real_path, c.getpid() });
     defer gpa.free(tmp);
 
     var tbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -340,6 +398,7 @@ pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const 
     if (fd < 0) return error.OpenFailed;
     {
         defer _ = close(fd);
+        _ = fchmod(fd, 0o600); // best-effort, matches JS fchmodSync
         var written: usize = 0;
         while (written < content.len) {
             const n = c.write(fd, content.ptr + written, content.len - written);
@@ -349,7 +408,7 @@ pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const 
     }
 
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = try toZ(&pbuf, path);
+    const pz = try toZ(&pbuf, real_path);
     if (c.rename(tz, pz) != 0) {
         _ = c.unlink(tz);
         return error.RenameFailed;
@@ -673,35 +732,37 @@ test "safeWriteFlag writes mode on clean path" {
     _ = c.unlink(try toZ(&fb, flag));
 }
 
-test "safeWriteFlag refuses symlinked GRANDPARENT (ancestor) dir" {
+test "safeWriteFlag ALLOWS a uid-owned symlinked parent dir (JS contract)" {
+    // Mirrors caveman-config.js: a symlinked flag dir is allowed iff its realpath
+    // target is a directory owned by the current uid (the legitimate
+    // ~/.claude-as-symlink pattern). The write lands in the real target dir.
     const gpa = std.testing.allocator;
     const dir_path = try makeTmpDir(gpa);
     defer gpa.free(dir_path);
 
-    // real/inner is the genuine tree; link -> real is the symlinked grandparent.
     const real = try std.fs.path.join(gpa, &.{ dir_path, "real" });
     defer gpa.free(real);
-    const inner = try std.fs.path.join(gpa, &.{ real, "inner" });
-    defer gpa.free(inner);
     const link = try std.fs.path.join(gpa, &.{ dir_path, "link" });
     defer gpa.free(link);
 
     var b1: [std.fs.max_path_bytes]u8 = undefined;
-    var b2: [std.fs.max_path_bytes]u8 = undefined;
     var b3: [std.fs.max_path_bytes]u8 = undefined;
-    _ = c.mkdir(try toZ(&b1, real), 0o700);
-    _ = c.mkdir(try toZ(&b2, inner), 0o700);
+    _ = c.mkdir(try toZ(&b1, real), 0o700); // owned by this test's uid
     try std.testing.expect(c.symlink(try toZ(&b1, real), try toZ(&b3, link)) == 0);
 
-    const flag = try std.fs.path.join(gpa, &.{ link, "inner", ".active3" });
+    // flag dir is the symlink `link` itself → realpath = real (uid-owned dir) → allowed.
+    const flag = try std.fs.path.join(gpa, &.{ link, ".active3" });
     defer gpa.free(flag);
+    try safeWriteFlag(gpa, flag, "full");
 
-    try std.testing.expectError(error.ParentSymlinkRefused, safeWriteFlag(gpa, flag, "full"));
-
-    const real_flag = try std.fs.path.join(gpa, &.{ inner, ".active3" });
+    // Written through to the real dir, not the symlink path.
+    const real_flag = try std.fs.path.join(gpa, &.{ real, ".active3" });
     defer gpa.free(real_flag);
-    try std.testing.expect(classify(real_flag) == .missing);
+    const data = try readSmall(gpa, real_flag);
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("full", data);
 
+    _ = c.unlink(try toZ(&b3, real_flag));
     _ = c.unlink(try toZ(&b3, link));
 }
 

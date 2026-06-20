@@ -672,7 +672,7 @@ fn readSettingsDoc(gpa: std.mem.Allocator, path: []const u8) ?SettingsDoc {
     const value = settings.parseSettings(gpa, raw) catch {
         // Existing-but-unparseable ⇒ JS null. Missing file already yields "".
         if (raw.len == 0) {
-            return .{ .arena = gpa, .value = .{ .object = .{} } };
+            return .{ .arena = gpa, .value = .{ .object = std.json.ObjectMap.init(gpa) } };
         }
         return null;
     };
@@ -1254,10 +1254,10 @@ fn installOpencode(ctx: *Ctx) void {
             if (isFileReal(opencode_json) and !pathExists(bak)) {
                 _ = copyFile(gpa, opencode_json, bak);
             }
-            if (doc.value != .object) doc.value = .{ .object = .{} };
+            if (doc.value != .object) doc.value = .{ .object = std.json.ObjectMap.init(arena) };
             // plugin array.
             if (doc.value.object.get("plugin") == null or doc.value.object.get("plugin").? != .array) {
-                doc.value.object.put(arena, "plugin", .{ .array = std.json.Array.init(arena) }) catch {};
+                doc.value.object.put("plugin", .{ .array = std.json.Array.init(arena) }) catch {};
             }
             const plugin_ptr = doc.value.object.getPtr("plugin").?;
             var has_plugin = false;
@@ -1268,12 +1268,12 @@ fn installOpencode(ctx: *Ctx) void {
 
             if (opts.with_mcp_shrink) {
                 if (doc.value.object.get("mcp") == null or doc.value.object.get("mcp").? != .object) {
-                    doc.value.object.put(arena, "mcp", .{ .object = .{} }) catch {};
+                    doc.value.object.put("mcp", .{ .object = std.json.ObjectMap.init(arena) }) catch {};
                 }
                 const mcp_ptr = doc.value.object.getPtr("mcp").?;
                 if (mcp_ptr.object.get("caveman-shrink") == null) {
-                    var entry: std.json.ObjectMap = .{};
-                    entry.put(arena, "type", .{ .string = "local" }) catch {};
+                    var entry = std.json.ObjectMap.init(arena);
+                    entry.put("type", .{ .string = "local" }) catch {};
                     var cmd_arr = std.json.Array.init(arena);
                     cmd_arr.append(.{ .string = "npx" }) catch {};
                     cmd_arr.append(.{ .string = "-y" }) catch {};
@@ -1282,9 +1282,9 @@ fn installOpencode(ctx: *Ctx) void {
                         var tit = std.mem.tokenizeAny(u8, joined, " ");
                         while (tit.next()) |tok| cmd_arr.append(.{ .string = arena.dupe(u8, tok) catch tok }) catch {};
                     }
-                    entry.put(arena, "command", .{ .array = cmd_arr }) catch {};
-                    entry.put(arena, "enabled", .{ .bool = true }) catch {};
-                    mcp_ptr.object.put(arena, "caveman-shrink", .{ .object = entry }) catch {};
+                    entry.put("command", .{ .array = cmd_arr }) catch {};
+                    entry.put("enabled", .{ .bool = true }) catch {};
+                    mcp_ptr.object.put("caveman-shrink", .{ .object = entry }) catch {};
                     out(fmt(ctx, "  registered caveman-shrink MCP server (wraps: {s})\n", .{opts.mcp_shrink_cmd orelse ""}));
                 }
             }
@@ -1467,10 +1467,10 @@ fn installHooks(ctx: *Ctx) []const u8 {
     {
         const sl_cmd = fmt(ctx, "bash \"{s}\"", .{statusline});
         if (doc.value == .object and doc.value.object.get("statusLine") == null) {
-            var slo: std.json.ObjectMap = .{};
-            slo.put(arena, "type", .{ .string = "command" }) catch {};
-            slo.put(arena, "command", .{ .string = sl_cmd }) catch {};
-            doc.value.object.put(arena, "statusLine", .{ .object = slo }) catch {};
+            var slo = std.json.ObjectMap.init(doc.arena);
+            slo.put("type", .{ .string = "command" }) catch {};
+            slo.put("command", .{ .string = sl_cmd }) catch {};
+            doc.value.object.put("statusLine", .{ .object = slo }) catch {};
             out("  statusline badge configured.\n");
         } else if (doc.value == .object) {
             const sl_val = doc.value.object.get("statusLine").?;
