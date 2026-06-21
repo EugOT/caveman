@@ -47,6 +47,20 @@ pub fn build(b: *std.Build) void {
         .{ .suffix = "shrink", .src = "src/shrink.zig" },
         .{ .suffix = "init", .src = "src/init.zig" },
         .{ .suffix = "settings", .src = "src/settings.zig" },
+        // R5: post-compression integrity validator (port of
+        // skills/caveman-compress/scripts/validate.py). Pure logic — no libc,
+        // no FS beyond reading the two argv files, allocator-only. Built as a
+        // standalone CLI used by the differential check, AND exported as an
+        // importable module below so the shrink proxy can call validate()
+        // in-process.
+        .{ .suffix = "compress-validate", .src = "src/compress_validate.zig" },
+        // R5: caveman-compress file-type detection (port of
+        // skills/caveman-compress/scripts/detect.py). Pure classification logic
+        // — no LLM, no subprocess, allocator-only; reads files via std.fs only in
+        // the no-extension content branch. Standalone CLI for the differential
+        // check, AND exported as an importable module below so the compress
+        // pipeline can call detectFileType() / shouldCompress() in-process.
+        .{ .suffix = "detect", .src = "src/compress_detect.zig" },
     };
 
     // The UserPromptSubmit hook keeps the `run` step (it reads stdin); the stats
@@ -57,6 +71,8 @@ pub fn build(b: *std.Build) void {
     var shrink_exe: ?*std.Build.Step.Compile = null;
     var init_exe: ?*std.Build.Step.Compile = null;
     var settings_exe: ?*std.Build.Step.Compile = null;
+    var compress_validate_exe: ?*std.Build.Step.Compile = null;
+    var detect_exe: ?*std.Build.Step.Compile = null;
 
     for (bins) |bin| {
         const exe = b.addExecutable(.{
@@ -80,6 +96,8 @@ pub fn build(b: *std.Build) void {
         if (std.mem.eql(u8, bin.suffix, "shrink")) shrink_exe = exe;
         if (std.mem.eql(u8, bin.suffix, "init")) init_exe = exe;
         if (std.mem.eql(u8, bin.suffix, "settings")) settings_exe = exe;
+        if (std.mem.eql(u8, bin.suffix, "compress-validate")) compress_validate_exe = exe;
+        if (std.mem.eql(u8, bin.suffix, "detect")) detect_exe = exe;
     }
 
     // settings.zig is also exported as an importable module so the future
@@ -91,6 +109,31 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     settings_module.link_libc = true;
+
+    // R5: the compress validator is also exported as an importable module so the
+    // shrink proxy (or any in-process caller) can run validate() without shelling
+    // out to the caveman-compress-validate CLI. Pure std; links libc only because
+    // the CLI wrapper's writeOut uses std.c.write — the validate() core is libc-
+    // free, but a single link flag keeps the module configuration uniform.
+    const compress_validate_module = b.addModule("compress_validate", .{
+        .root_source_file = b.path("src/compress_validate.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compress_validate_module.link_libc = true;
+
+    // R5: the file-type detector is also exported as an importable module so the
+    // compress pipeline (or any in-process caller) can run detectFileType() /
+    // shouldCompress() without shelling out to the caveman-detect CLI. Pure std
+    // (StaticStringMap tables, std.json.validate, byte-scanners); links libc only
+    // to keep the module configuration uniform with the others — the detector
+    // core is libc-free.
+    const compress_detect_module = b.addModule("detect", .{
+        .root_source_file = b.path("src/compress_detect.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    compress_detect_module.link_libc = true;
 
     // R4b stage 1 lib helpers ported from bin/lib/*.js. These are importable
     // MODULES the installer port (stage 2) `@import`s instead of shelling out:
@@ -135,6 +178,74 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     opencode_agent_module.link_libc = true;
+
+    // R5 stage 1 — the compress-protect structural guards ported from
+    // skills/caveman-compress/scripts/compress.py (split_frontmatter,
+    // is_sensitive_path, strip_llm_wrapper). Pure string/path logic, no syscalls
+    // (the CLI driver below adds the only I/O). Exported as a module so the
+    // future compress orchestrator port can `@import` it, plus a standalone CLI
+    // (`<tool>-compress-protect`) that the differential check feeds fixtures to.
+    const compress_protect_module = b.addModule("compress_protect", .{
+        .root_source_file = b.path("src/compress_protect.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const compress_protect_exe = b.addExecutable(.{
+        .name = b.fmt("{s}-compress-protect", .{tool}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compress_protect_cli.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    compress_protect_exe.root_module.link_libc = true; // raw libc-fd stdio
+    compress_protect_exe.root_module.addImport("compress_protect.zig", compress_protect_module);
+    b.installArtifact(compress_protect_exe);
+
+    const run_compress_protect_step = b.step("run-compress-protect", "Run the compress-protect differential CLI");
+    const run_compress_protect = b.addRunArtifact(compress_protect_exe);
+    if (b.args) |args| run_compress_protect.addArgs(args);
+    run_compress_protect_step.dependOn(&run_compress_protect.step);
+
+    // R5 stage 2 — the compress orchestrator (src/compress_cmd.zig), a port of
+    // skills/caveman-compress/scripts/compress.py + cli.py. Binary
+    // `<tool>-compress`: argv[1] = filepath, size-check + sensitive reject,
+    // should_compress gate, frontmatter split, LLM call (`claude --print` via
+    // fork+pipe with the prompt on stdin), validate+retry, backup + write +
+    // restore-on-failure. It IMPORTS the three R5a modules (compress_protect,
+    // detect, compress_validate) plus a dedicated common.zig clone (the
+    // importable modules above are configured for their own roots; the
+    // orchestrator gets its own wiring, like install.zig). All link libc — the
+    // fork+pipe shim and the libc-fd file IO are C-ABI.
+    const cmd_common = b.createModule(.{
+        .root_source_file = b.path("src/common.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    cmd_common.link_libc = true;
+    cmd_common.addOptions("build_options", opts);
+
+    const compress_cmd_exe = b.addExecutable(.{
+        .name = b.fmt("{s}-compress", .{tool}),
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/compress_cmd.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    compress_cmd_exe.root_module.link_libc = true;
+    compress_cmd_exe.root_module.addOptions("build_options", opts);
+    compress_cmd_exe.root_module.addImport("common.zig", cmd_common);
+    compress_cmd_exe.root_module.addImport("compress_protect.zig", compress_protect_module);
+    compress_cmd_exe.root_module.addImport("detect", compress_detect_module);
+    compress_cmd_exe.root_module.addImport("compress_validate", compress_validate_module);
+    b.installArtifact(compress_cmd_exe);
+
+    const run_compress_step = b.step("run-compress", "Run the caveman-compress orchestrator");
+    const run_compress = b.addRunArtifact(compress_cmd_exe);
+    if (b.args) |args| run_compress.addArgs(args);
+    run_compress_step.dependOn(&run_compress.step);
 
     // R4b stage 2 — the installer port (src/install.zig). A single binary,
     // `caveman-install`, that detects installed agents and installs caveman for
@@ -240,6 +351,16 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_settings.addArgs(args);
     run_settings_step.dependOn(&run_settings.step);
 
+    const run_compress_validate_step = b.step("run-compress-validate", "Run the caveman-compress-validate integrity checker");
+    const run_compress_validate = b.addRunArtifact(compress_validate_exe.?);
+    if (b.args) |args| run_compress_validate.addArgs(args);
+    run_compress_validate_step.dependOn(&run_compress_validate.step);
+
+    const run_detect_step = b.step("run-detect", "Run the caveman-detect file-type classifier");
+    const run_detect = b.addRunArtifact(detect_exe.?);
+    if (b.args) |args| run_detect.addArgs(args);
+    run_detect_step.dependOn(&run_detect.step);
+
     // ── Tests ───────────────────────────────────────────────────────────────
     // One test artifact per source root; the `test` step runs them all. Each
     // root pulls in common.zig via refAllDecls, so the shared security core is
@@ -257,6 +378,73 @@ pub fn build(b: *std.Build) void {
         t.root_module.link_libc = true;
         if (std.mem.eql(u8, bin.suffix, "init")) addInitEmbeds(b, t.root_module);
         test_step.dependOn(&b.addRunArtifact(t).step);
+    }
+
+    // R5 compress-protect test root. Pure module — no common.zig, no libc, no
+    // build_options. Joins the shared `test` step and also gets its own
+    // `test-compress-protect` step so a maintainer can run just these.
+    {
+        const cp_test = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/compress_protect.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        const run_cp_test_step = b.step("test-compress-protect", "Run the compress-protect unit tests");
+        run_cp_test_step.dependOn(&b.addRunArtifact(cp_test).step);
+        test_step.dependOn(&b.addRunArtifact(cp_test).step);
+    }
+
+    // R5 stage 2 — compress orchestrator test root. compress_cmd.zig imports the
+    // three R5a modules + common.zig by the same names the source uses; wire them
+    // per-test-root (a test artifact's root module is distinct from the
+    // importable addModule wiring above). Joins the shared `test` step and gets
+    // its own `test-compress-cmd` step.
+    {
+        const cmd_test_common = b.createModule(.{
+            .root_source_file = b.path("src/common.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        cmd_test_common.link_libc = true;
+        cmd_test_common.addOptions("build_options", opts);
+
+        const cmd_test_protect = b.addModule("compress_protect_t", .{
+            .root_source_file = b.path("src/compress_protect.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        const cmd_test_detect = b.addModule("detect_t", .{
+            .root_source_file = b.path("src/compress_detect.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        cmd_test_detect.link_libc = true;
+        const cmd_test_validate = b.addModule("compress_validate_t", .{
+            .root_source_file = b.path("src/compress_validate.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        cmd_test_validate.link_libc = true;
+
+        const cmd_test = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/compress_cmd.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        cmd_test.root_module.link_libc = true;
+        cmd_test.root_module.addOptions("build_options", opts);
+        cmd_test.root_module.addImport("common.zig", cmd_test_common);
+        cmd_test.root_module.addImport("compress_protect.zig", cmd_test_protect);
+        cmd_test.root_module.addImport("detect", cmd_test_detect);
+        cmd_test.root_module.addImport("compress_validate", cmd_test_validate);
+
+        const run_cmd_test_step = b.step("test-compress-cmd", "Run the compress orchestrator unit tests");
+        run_cmd_test_step.dependOn(&b.addRunArtifact(cmd_test).step);
+        test_step.dependOn(&b.addRunArtifact(cmd_test).step);
     }
 
     // R4b stage 1 lib-helper test roots. Each is its own test artifact (a test
