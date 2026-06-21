@@ -276,7 +276,18 @@ fn trimTrailingSlash(s: []const u8) []const u8 {
 }
 
 pub fn ancestorUnsafe(dir: []const u8) bool {
-    const bases: [3]?[]const u8 = .{ getenv("HOME"), getenv("TMPDIR"), getenv("CLAUDE_CONFIG_DIR") };
+    // Trusted roots. Beyond HOME/TMPDIR/CLAUDE_CONFIG_DIR, honor the configured
+    // agent roots (XDG, opencode, openclaw, nullclaw) so a legitimate config dir
+    // outside HOME is not wrongly refused. (PR #8 / 511a8c1.)
+    const bases: [7]?[]const u8 = .{
+        getenv("HOME"),
+        getenv("TMPDIR"),
+        getenv("CLAUDE_CONFIG_DIR"),
+        getenv("XDG_CONFIG_HOME"),
+        getenv("OPENCODE_CONFIG_DIR"),
+        getenv("OPENCLAW_WORKSPACE"),
+        getenv("NULLCLAW_WORKSPACE"),
+    };
 
     var best_base: ?[]const u8 = null;
     for (bases) |maybe| {
@@ -737,6 +748,44 @@ test "safeWriteFlag writes mode on clean path" {
 
     var fb: [std.fs.max_path_bytes]u8 = undefined;
     _ = c.unlink(try toZ(&fb, flag));
+}
+
+test "safeWriteFlag honors configured opencode root outside HOME" {
+    // A legit config dir under $OPENCODE_CONFIG_DIR (not HOME/TMPDIR) must be a
+    // trusted base — otherwise ancestorUnsafe refuses every write there. (PR #8.)
+    const gpa = std.testing.allocator;
+    const old_tmp = try saveEnv(gpa, "TMPDIR");
+    defer if (old_tmp) |v| gpa.free(v);
+    defer restoreEnv("TMPDIR", old_tmp);
+    const old_opencode = try saveEnv(gpa, "OPENCODE_CONFIG_DIR");
+    defer if (old_opencode) |v| gpa.free(v);
+    defer restoreEnv("OPENCODE_CONFIG_DIR", old_opencode);
+
+    _ = unsetenv("TMPDIR");
+
+    const dir_path = try makeTmpDir(gpa);
+    defer gpa.free(dir_path);
+    const root = try std.fs.path.join(gpa, &.{ dir_path, "external-opencode" });
+    defer gpa.free(root);
+    try mkdirPath(root);
+
+    const root_z = try gpa.dupeZ(u8, root);
+    defer gpa.free(root_z);
+    _ = setenv("OPENCODE_CONFIG_DIR", root_z.ptr, 1);
+
+    const nested = try std.fs.path.join(gpa, &.{ root, "plugins", "caveman" });
+    defer gpa.free(nested);
+    try std.testing.expect(!ancestorUnsafe(nested));
+
+    const settings = try std.fs.path.join(gpa, &.{ root, "opencode.json" });
+    defer gpa.free(settings);
+    try safeWriteFlag(gpa, settings, "{}\n");
+    const data = try readSmall(gpa, settings);
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("{}\n", data);
+
+    var sbuf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = c.unlink(try toZ(&sbuf, settings));
 }
 
 test "safeWriteFlag ALLOWS a uid-owned symlinked parent dir (JS contract)" {
