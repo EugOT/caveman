@@ -22,7 +22,7 @@
 //!   - compress_protect.zig  → splitFrontmatter, isSensitivePath, stripLlmWrapper
 //!   - compress_detect.zig   → shouldCompress (natural-language gate)
 //!   - compress_validate.zig → validate (six structural checks) + Result
-//!   - common.zig            → toZ, readFileAlloc, isRegularFileNoSymlink,
+//!   - common.zig            → readFileAlloc, isRegularFileNoSymlink,
 //!                             existsNoFollow, getenv, writeStdout/writeStderr
 //! The libc C-ABI fork+pipe pattern (captureStdout in main.zig / captureSpawn in
 //! install.zig) is extended here with a stdin-writing variant (the child reads
@@ -33,6 +33,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const c = std.c;
+const is_windows = builtin.os.tag == .windows;
 
 const protect = @import("compress_protect.zig");
 const detect = @import("detect");
@@ -314,9 +315,17 @@ fn pathStem(name: []const u8) []const u8 {
     return base[0..dot];
 }
 
+/// Permissions value for a 0700 dir (POSIX mode; default on Windows, which has
+/// no POSIX mode bits). Mirrors common.perm700 — same 0700-or-default contract.
+fn perm700() std.Io.File.Permissions {
+    return if (is_windows) .default_dir else .fromMode(0o700);
+}
+
 /// mkdir -p over an absolute/relative path (each component 0700). Best-effort;
 /// EEXIST is benign. Mirrors backup_dir.mkdir(parents=True, exist_ok=True).
-fn mkdirParents(gpa: std.mem.Allocator, dir: []const u8) void {
+/// std.Io: each component goes through Dir.createDir; an AlreadyExists error is
+/// ignored exactly as the old `_ = c.mkdir(...)` discarded EEXIST.
+fn mkdirParents(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) void {
     if (dir.len == 0) return;
     var i: usize = 0;
     // Skip a leading '/' so the first component is non-empty.
@@ -326,9 +335,7 @@ fn mkdirParents(gpa: std.mem.Allocator, dir: []const u8) void {
             if (i == 0) continue;
             const prefix = dir[0..i];
             if (prefix.len == 0) continue;
-            var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-            const pz = common.toZ(&pbuf, prefix) catch return;
-            _ = c.mkdir(pz, 0o700);
+            std.Io.Dir.cwd().createDir(io, prefix, perm700()) catch {};
         }
     }
     _ = gpa; // no allocation; signature kept uniform with the other helpers
@@ -346,56 +353,45 @@ fn mkdirParents(gpa: std.mem.Allocator, dir: []const u8) void {
 const FileError = error{ OpenFailed, WriteFailed, ReadFailed, OutOfMemory, PathTooLong };
 
 /// write_text(path, content) — truncate-or-create, 0644-ish (umask applies).
-fn writeTextFile(path: []const u8, content: []const u8) FileError!void {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = common.toZ(&pbuf, path) catch return error.PathTooLong;
-    const flags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
-    const fd = c.open(pz, flags, @as(c.mode_t, 0o644));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = common.close(fd);
-    var written: usize = 0;
-    while (written < content.len) {
-        const n = c.write(fd, content.ptr + written, content.len - written);
-        if (n <= 0) return error.WriteFailed;
-        written += @intCast(n);
-    }
+/// Follows symlinks like Python's Path.write_text (createFile with default
+/// truncate, follow semantics). std.Io, cross-compiles.
+fn writeTextFile(io: std.Io, path: []const u8, content: []const u8) FileError!void {
+    const cwd = std.Io.Dir.cwd();
+    var f = cwd.createFile(io, path, .{
+        .permissions = if (is_windows) .default_file else .fromMode(0o644),
+    }) catch return error.OpenFailed;
+    defer f.close(io);
+    f.writePositionalAll(io, content, 0) catch return error.WriteFailed;
 }
 
 /// read_text(path, errors="ignore") — full read, follows symlinks (plain open).
 /// Caller owns. Bounded by `max_bytes`.
-fn readTextFile(gpa: std.mem.Allocator, path: []const u8, max_bytes: usize) FileError![]u8 {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = common.toZ(&pbuf, path) catch return error.PathTooLong;
-    const flags: c.O = .{ .ACCMODE = .RDONLY };
-    const fd = c.open(pz, flags, @as(c.mode_t, 0));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = common.close(fd);
+fn readTextFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8, max_bytes: usize) FileError![]u8 {
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.OpenFailed;
+    defer f.close(io);
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(gpa);
     var rbuf: [4096]u8 = undefined;
+    var offset: u64 = 0;
     while (true) {
-        const n = c.read(fd, &rbuf, rbuf.len);
-        if (n < 0) return error.ReadFailed;
+        var iov = [_][]u8{&rbuf};
+        const n = f.readPositional(io, &iov, offset) catch return error.ReadFailed;
         if (n == 0) break;
-        if (buf.items.len + @as(usize, @intCast(n)) > max_bytes) return error.ReadFailed;
-        buf.appendSlice(gpa, rbuf[0..@intCast(n)]) catch return error.OutOfMemory;
+        if (buf.items.len + n > max_bytes) return error.ReadFailed;
+        buf.appendSlice(gpa, rbuf[0..n]) catch return error.OutOfMemory;
+        offset += n;
     }
     return buf.toOwnedSlice(gpa);
 }
 
-/// lstat size of a path (size field is off_t in this std). null on stat failure.
-fn fileSize(path: []const u8) ?u64 {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = common.toZ(&pbuf, path) catch return null;
-    var st: c.Stat = undefined;
-    if (common.stat(pz, &st) != 0) return null; // follow symlinks like Path.stat()
-    return @intCast(st.size);
+/// stat size of a path (follows symlinks like Path.stat()). null on stat failure.
+fn fileSize(io: std.Io, path: []const u8) ?u64 {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = true }) catch return null;
+    return st.size;
 }
 
-fn unlinkPath(path: []const u8) void {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = common.toZ(&pbuf, path) catch return;
-    _ = c.unlink(pz);
+fn unlinkPath(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
 }
 
 // ── Core orchestration (compress_file) ───────────────────────────────────────-
@@ -413,16 +409,16 @@ const Outcome = enum {
 
 /// compress_file(filepath). Returns the Outcome; prints the same progress /
 /// failure lines compress.py does (stdout) so behavior is observable + testable.
-fn compressFile(gpa: std.mem.Allocator, filepath: []const u8) Outcome {
+fn compressFile(io: std.Io, gpa: std.mem.Allocator, filepath: []const u8) Outcome {
     // not exists / too large → raise (refused/error). cli.py already checks
     // existence, but compress_file re-checks; we mirror that.
-    if (!common.existsNoFollow(filepath)) {
+    if (!common.existsNoFollow(io, filepath)) {
         err("File not found: ");
         err(filepath);
         err("\n");
         return .refused;
     }
-    if (fileSize(filepath)) |sz| {
+    if (fileSize(io, filepath)) |sz| {
         if (sz > MAX_FILE_SIZE) {
             err("File too large to compress safely (max 500KB): ");
             err(filepath);
@@ -446,13 +442,13 @@ fn compressFile(gpa: std.mem.Allocator, filepath: []const u8) Outcome {
 
     // should_compress gate. Use lstat to decide is_file (the detector refuses
     // symlinks for content reads — consistent with the rest of the hooks).
-    const is_file = common.isRegularFileNoSymlink(filepath);
-    if (!detect.shouldCompress(gpa, filepath, is_file)) {
+    const is_file = common.isRegularFileNoSymlink(io, filepath);
+    if (!detect.shouldCompress(io, gpa, filepath, is_file)) {
         out("Skipping (not natural language)\n");
         return .skipped;
     }
 
-    const original_text = readTextFile(gpa, filepath, MAX_FILE_SIZE) catch {
+    const original_text = readTextFile(io, gpa, filepath, MAX_FILE_SIZE) catch {
         err("Could not read file: ");
         err(filepath);
         err("\n");
@@ -466,7 +462,7 @@ fn compressFile(gpa: std.mem.Allocator, filepath: []const u8) Outcome {
         return .error_internal;
     };
     defer gpa.free(backup_dir);
-    mkdirParents(gpa, backup_dir);
+    mkdirParents(io, gpa, backup_dir);
     const stem = pathStem(filepath);
     const backup_path = std.fmt.allocPrint(gpa, "{s}/{s}.original.md", .{ backup_dir, stem }) catch return .error_internal;
     defer gpa.free(backup_path);
@@ -477,7 +473,7 @@ fn compressFile(gpa: std.mem.Allocator, filepath: []const u8) Outcome {
     }
 
     // Backup-already-exists guard (prevent clobbering an earlier original).
-    if (common.existsNoFollow(backup_path)) {
+    if (common.existsNoFollow(io, backup_path)) {
         out("Backup file already exists: ");
         out(backup_path);
         out("\nThe original backup may contain important content.\nAborting to prevent data loss. Please remove or rename the backup file if you want to proceed.\n");
@@ -528,14 +524,14 @@ fn compressFile(gpa: std.mem.Allocator, filepath: []const u8) Outcome {
     defer gpa.free(compressed);
 
     // Backup the original, then verify the readback before touching the input.
-    writeTextFile(backup_path, original_text) catch {
+    writeTextFile(io, backup_path, original_text) catch {
         err("Could not write backup: ");
         err(backup_path);
         err("\n");
         return .error_internal;
     };
-    const backup_readback = readTextFile(gpa, backup_path, MAX_FILE_SIZE) catch {
-        unlinkPath(backup_path);
+    const backup_readback = readTextFile(io, gpa, backup_path, MAX_FILE_SIZE) catch {
+        unlinkPath(io, backup_path);
         out("Backup write verification failed: ");
         out(backup_path);
         out("\n   In-memory original differs from on-disk backup. Aborting before touching the input file.\n");
@@ -543,14 +539,14 @@ fn compressFile(gpa: std.mem.Allocator, filepath: []const u8) Outcome {
     };
     defer gpa.free(backup_readback);
     if (!std.mem.eql(u8, backup_readback, original_text)) {
-        unlinkPath(backup_path);
+        unlinkPath(io, backup_path);
         out("Backup write verification failed: ");
         out(backup_path);
         out("\n   In-memory original differs from on-disk backup. Aborting before touching the input file.\n");
         return .skipped;
     }
 
-    writeTextFile(filepath, compressed) catch {
+    writeTextFile(io, filepath, compressed) catch {
         // Could not write primary; leave backup so the user can recover.
         err("Could not write compressed file: ");
         err(filepath);
@@ -570,9 +566,9 @@ fn compressFile(gpa: std.mem.Allocator, filepath: []const u8) Outcome {
             out("\n");
         }
 
-        const orig_on_disk = readTextFile(gpa, backup_path, MAX_FILE_SIZE) catch return .error_internal;
+        const orig_on_disk = readTextFile(io, gpa, backup_path, MAX_FILE_SIZE) catch return .error_internal;
         defer gpa.free(orig_on_disk);
-        const comp_on_disk = readTextFile(gpa, filepath, MAX_FILE_SIZE) catch return .error_internal;
+        const comp_on_disk = readTextFile(io, gpa, filepath, MAX_FILE_SIZE) catch return .error_internal;
         defer gpa.free(comp_on_disk);
 
         var result = validate_mod.validate(gpa, orig_on_disk, comp_on_disk) catch return .error_internal;
@@ -592,8 +588,8 @@ fn compressFile(gpa: std.mem.Allocator, filepath: []const u8) Outcome {
 
         if (attempt == MAX_RETRIES - 1) {
             // Restore original, drop backup — terminal failure.
-            writeTextFile(filepath, original_text) catch {};
-            unlinkPath(backup_path);
+            writeTextFile(io, filepath, original_text) catch {};
+            unlinkPath(io, backup_path);
             out("Failed after retries — original restored\n");
             return .failed_retries;
         }
@@ -606,8 +602,8 @@ fn compressFile(gpa: std.mem.Allocator, filepath: []const u8) Outcome {
             else => {
                 // On a fix-call failure, restore and bail (compress.py would
                 // raise out of the loop). Restore the original to be safe.
-                writeTextFile(filepath, original_text) catch {};
-                unlinkPath(backup_path);
+                writeTextFile(io, filepath, original_text) catch {};
+                unlinkPath(io, backup_path);
                 err("Fix call failed — original restored\n");
                 return .error_internal;
             },
@@ -615,7 +611,7 @@ fn compressFile(gpa: std.mem.Allocator, filepath: []const u8) Outcome {
         // Replace `compressed` with the fixed text and write it out.
         gpa.free(compressed);
         compressed = fixed;
-        writeTextFile(filepath, compressed) catch return .error_internal;
+        writeTextFile(io, filepath, compressed) catch return .error_internal;
     }
 
     // Unreachable: the loop always returns inside (success / terminal failure).
@@ -634,6 +630,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
+    // Construct the std.Io backend once; thread it down to every FS fn.
+    var threaded = common.threaded();
+    defer threaded.deinit();
+    const io = threaded.io();
+
     // Exactly one positional argument (cli.py: len(sys.argv) != 2 → usage, exit 1).
     var it = init.args.iterate();
     defer it.deinit();
@@ -648,13 +649,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     // cli.py pre-checks: exists + is_file.
-    if (!common.existsNoFollow(filepath)) {
+    if (!common.existsNoFollow(io, filepath)) {
         err("File not found: ");
         err(filepath);
         err("\n");
         std.process.exit(1);
     }
-    if (!common.isRegularFileNoSymlink(filepath)) {
+    if (!common.isRegularFileNoSymlink(io, filepath)) {
         err("Not a file: ");
         err(filepath);
         err("\n");
@@ -663,7 +664,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     out("Starting caveman compression...\n\n");
 
-    switch (compressFile(gpa, filepath)) {
+    switch (compressFile(io, gpa, filepath)) {
         .compressed => {
             out("\nCompression completed successfully\n");
             std.process.exit(0);
@@ -790,58 +791,73 @@ test "isBlank matches Python strip() truthiness" {
 }
 
 test "compressFile refuses sensitive filenames before any read" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
     // Create a real sensitive-named file in a temp dir, then expect .refused
     // (the isSensitivePath guard fires before should_compress / read).
-    const dir = try common.makeTmpDir(gpa);
+    const dir = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir);
     const path = try std.fmt.allocPrint(gpa, "{s}/credentials.md", .{dir});
     defer gpa.free(path);
-    try writeTextFile(path, "secret stuff inside\n");
-    defer unlinkPath(path);
+    try writeTextFile(io, path, "secret stuff inside\n");
+    defer unlinkPath(io, path);
 
-    try testing.expectEqual(Outcome.refused, compressFile(gpa, path));
+    try testing.expectEqual(Outcome.refused, compressFile(io, gpa, path));
 }
 
 test "compressFile skips code files (should_compress gate)" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir = try common.makeTmpDir(gpa);
+    const dir = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir);
     const path = try std.fmt.allocPrint(gpa, "{s}/main.py", .{dir});
     defer gpa.free(path);
-    try writeTextFile(path, "import os\nprint('hi')\n");
-    defer unlinkPath(path);
+    try writeTextFile(io, path, "import os\nprint('hi')\n");
+    defer unlinkPath(io, path);
 
-    try testing.expectEqual(Outcome.skipped, compressFile(gpa, path));
+    try testing.expectEqual(Outcome.skipped, compressFile(io, gpa, path));
 }
 
 test "compressFile refuses missing files" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    try testing.expectEqual(Outcome.refused, compressFile(gpa, "/nonexistent/path/does-not-exist.md"));
+    try testing.expectEqual(Outcome.refused, compressFile(io, gpa, "/nonexistent/path/does-not-exist.md"));
 }
 
 test "compressFile skips empty / whitespace-only markdown" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir = try common.makeTmpDir(gpa);
+    const dir = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir);
     const path = try std.fmt.allocPrint(gpa, "{s}/blank.md", .{dir});
     defer gpa.free(path);
-    try writeTextFile(path, "   \n\t\n");
-    defer unlinkPath(path);
+    try writeTextFile(io, path, "   \n\t\n");
+    defer unlinkPath(io, path);
 
-    try testing.expectEqual(Outcome.skipped, compressFile(gpa, path));
+    try testing.expectEqual(Outcome.skipped, compressFile(io, gpa, path));
 }
 
 test "writeTextFile + readTextFile round-trips bytes" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir = try common.makeTmpDir(gpa);
+    const dir = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir);
     const path = try std.fmt.allocPrint(gpa, "{s}/rt.md", .{dir});
     defer gpa.free(path);
-    defer unlinkPath(path);
+    defer unlinkPath(io, path);
     const content = "line one\nline two\n";
-    try writeTextFile(path, content);
-    const back = try readTextFile(gpa, path, MAX_FILE_SIZE);
+    try writeTextFile(io, path, content);
+    const back = try readTextFile(io, gpa, path, MAX_FILE_SIZE);
     defer gpa.free(back);
     try testing.expectEqualStrings(content, back);
 }

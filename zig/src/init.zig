@@ -20,11 +20,19 @@
 //! ride alongside the installer port); here they report unsupported-standalone
 //! like the JS does when the helper module is absent.
 //!
-//! libc C-ABI throughout (std.c) — matches the rest of the Zig hook tree.
+//! Filesystem core on std.fs/std.Io (statFile/openFile/createFile/createDir/
+//! createDirPath/rename/deleteFile/deleteTree/symLink) so init cross-compiles
+//! the same way common.zig's security core does. A std.Io.Threaded backend is
+//! constructed once in main() and threaded down to every FS fn. The few libc
+//! C-ABI calls that remain are the non-FS process/stdio surface common.zig also
+//! keeps (env, getpid, getcwd, gettimeofday, write/read on fds) — not Stat/O/S
+//! or path open/read/write, which now all route through std.Io.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const common = @import("common.zig");
 const c = std.c;
+const is_windows = builtin.os.tag == .windows;
 
 // Embedded sources-of-truth. They live OUTSIDE the zig/ package root
 // (src/rules/, skills/), so build.zig exposes them as named anonymous imports
@@ -134,13 +142,6 @@ const WriteError = error{
     PathTooLong,
 } || std.mem.Allocator.Error;
 
-fn toZ(buf: []u8, s: []const u8) WriteError![*:0]const u8 {
-    if (s.len + 1 > buf.len) return error.PathTooLong;
-    @memcpy(buf[0..s.len], s);
-    buf[s.len] = 0;
-    return @ptrCast(buf.ptr);
-}
-
 /// True if writing `target` would pass through a symlink/non-dir ANYWHERE in the
 /// chain from `root` down to the parent dir. Mirrors unsafeParentReason: anchor
 /// at root, walk each component of relative(root, parent), refuse symlink or
@@ -151,7 +152,7 @@ fn toZ(buf: []u8, s: []const u8) WriteError![*:0]const u8 {
 /// a lexical prefix check rather than std.fs.path.relative (whose 0.16 signature
 /// now threads cwd/environ for the Io surface). `gpa` is unused but kept in the
 /// signature so callers don't need to special-case allocation.
-fn unsafeParent(gpa: std.mem.Allocator, target: []const u8, root: []const u8) bool {
+fn unsafeParent(io: std.Io, gpa: std.mem.Allocator, target: []const u8, root: []const u8) bool {
     _ = gpa;
     const parent = std.fs.path.dirname(target) orelse return false;
 
@@ -173,7 +174,7 @@ fn unsafeParent(gpa: std.mem.Allocator, target: []const u8, root: []const u8) bo
     }
 
     // Root itself must be a real dir if it exists.
-    switch (common.classify(root_clean)) {
+    switch (common.classify(io, root_clean)) {
         .symlink, .other => return true,
         else => {},
     }
@@ -190,7 +191,7 @@ fn unsafeParent(gpa: std.mem.Allocator, target: []const u8, root: []const u8) bo
         cur_buf[cur_len] = '/';
         @memcpy(cur_buf[cur_len + 1 ..][0..part.len], part);
         cur_len += 1 + part.len;
-        switch (common.classify(cur_buf[0..cur_len])) {
+        switch (common.classify(io, cur_buf[0..cur_len])) {
             .missing => return false, // not created yet → mkdir makes real dirs
             .symlink, .other => return true,
             .dir => {},
@@ -200,34 +201,27 @@ fn unsafeParent(gpa: std.mem.Allocator, target: []const u8, root: []const u8) bo
 }
 
 /// mkdir -p each component of `dir` (0755), best-effort.
-fn mkdirP(dir: []const u8) void {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (dir.len >= buf.len) return;
-    var i: usize = 0;
-    // Walk components, creating progressively.
-    while (i < dir.len) {
-        // advance to next separator
-        var j = i;
-        while (j < dir.len and dir[j] != std.fs.path.sep) j += 1;
-        const prefix = dir[0..j];
-        if (prefix.len > 0) {
-            @memcpy(buf[0..prefix.len], prefix);
-            buf[prefix.len] = 0;
-            _ = c.mkdir(@ptrCast(buf[0..prefix.len :0].ptr), 0o755);
-        }
-        i = j + 1;
-    }
+///
+/// STDLIB FIRST: std.Io.Dir.createDirPathStatus is the recursive mkdir -p
+/// primitive (createDirPath with an explicit Permissions). Best-effort like the
+/// old c.mkdir loop — every error is swallowed (a pre-existing dir, a race, or a
+/// refused component all leave the later symlink-safe re-checks to reject the
+/// write). 0o755 mode preserved exactly via Permissions.fromMode.
+fn mkdirP(io: std.Io, dir: []const u8) void {
+    if (dir.len == 0) return;
+    const perms: std.Io.File.Permissions = if (is_windows) .default_dir else .fromMode(0o755);
+    _ = std.Io.Dir.cwd().createDirPathStatus(io, dir, perms) catch {};
 }
 
-fn writeFileSafe(gpa: std.mem.Allocator, target: []const u8, content: []const u8, root: []const u8) WriteError!void {
-    if (common.isSymlink(target)) return error.SymlinkRefused;
-    if (unsafeParent(gpa, target, root)) return error.UnsafeParent;
+fn writeFileSafe(io: std.Io, gpa: std.mem.Allocator, target: []const u8, content: []const u8, root: []const u8) WriteError!void {
+    if (common.isSymlink(io, target)) return error.SymlinkRefused;
+    if (unsafeParent(io, gpa, target, root)) return error.UnsafeParent;
 
     const dir = std.fs.path.dirname(target) orelse ".";
-    mkdirP(dir);
+    mkdirP(io, dir);
 
-    if (common.isSymlink(target)) return error.SymlinkRefused;
-    if (unsafeParent(gpa, target, root)) return error.UnsafeParent;
+    if (common.isSymlink(io, target)) return error.SymlinkRefused;
+    if (unsafeParent(io, gpa, target, root)) return error.UnsafeParent;
 
     const tmp = try std.fmt.allocPrint(gpa, "{s}/.{s}.{d}.{d}.tmp", .{
         dir,
@@ -237,32 +231,26 @@ fn writeFileSafe(gpa: std.mem.Allocator, target: []const u8, content: []const u8
     });
     defer gpa.free(tmp);
 
-    var tbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const tz = try toZ(&tbuf, tmp);
-    // O_WRONLY|O_CREAT|O_EXCL ("wx"), mode 0644.
-    const flags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true };
-    const fd = c.open(tz, flags, @as(c.mode_t, 0o644));
-    if (fd < 0) return error.OpenFailed;
+    const cwd = std.Io.Dir.cwd();
+    // O_CREAT|O_EXCL ("wx"), mode 0644. O_EXCL refuses an existing leaf (incl. a
+    // symlink), the same clobber guard the raw open had.
+    var f = cwd.createFile(io, tmp, .{
+        .exclusive = true,
+        .permissions = if (is_windows) .default_file else .fromMode(0o644),
+    }) catch return error.OpenFailed;
     {
-        var written: usize = 0;
-        while (written < content.len) {
-            const n = c.write(fd, content.ptr + written, content.len - written);
-            if (n <= 0) {
-                _ = c.close(fd);
-                _ = c.unlink(tz);
-                return error.WriteFailed;
-            }
-            written += @intCast(n);
-        }
-        _ = c.close(fd);
+        f.writePositionalAll(io, content, 0) catch {
+            f.close(io);
+            cwd.deleteFile(io, tmp) catch {};
+            return error.WriteFailed;
+        };
+        f.close(io);
     }
 
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = try toZ(&pbuf, target);
-    if (c.rename(tz, pz) != 0) {
-        _ = c.unlink(tz);
+    cwd.rename(tmp, cwd, target, io) catch {
+        cwd.deleteFile(io, tmp) catch {};
         return error.RenameFailed;
-    }
+    };
 }
 
 // ── Per-agent processing (mirrors processAgent) ────────────────────────────
@@ -280,28 +268,24 @@ const Opts = struct {
     help: bool = false,
 };
 
-fn lstatExists(path: []const u8) bool {
-    return common.classify(path) != .missing;
+fn lstatExists(io: std.Io, path: []const u8) bool {
+    return common.classify(io, path) != .missing;
 }
 
-fn isSymlinkPath(path: []const u8) bool {
-    return common.classify(path) == .symlink;
+fn isSymlinkPath(io: std.Io, path: []const u8) bool {
+    return common.classify(io, path) == .symlink;
 }
 
-fn isRegularFile(path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(&buf, path) catch return false;
-    var st: c.Stat = undefined;
-    if (common.lstat(z, &st) != 0) return false;
-    return (st.mode & c.S.IFMT) == c.S.IFREG;
+fn isRegularFile(io: std.Io, path: []const u8) bool {
+    return common.isRegularFileNoSymlink(io, path);
 }
 
-fn readWholeFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+fn readWholeFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
     // No symlink follow; cap large but generous.
-    return common.readFileAlloc(gpa, path, 4 * 1024 * 1024);
+    return common.readFileAlloc(io, gpa, path, 4 * 1024 * 1024);
 }
 
-fn processAgent(gpa: std.mem.Allocator, agent: Agent, opts: *const Opts) !Result {
+fn processAgent(io: std.Io, gpa: std.mem.Allocator, agent: Agent, opts: *const Opts) !Result {
     if (agent.mode == .installer_openclaw) {
         return .{
             .status = "unsupported-standalone",
@@ -320,23 +304,23 @@ fn processAgent(gpa: std.mem.Allocator, agent: Agent, opts: *const Opts) !Result
     const full = try std.fs.path.join(gpa, &.{ opts.target, agent.file.? });
     defer gpa.free(full);
 
-    const target_exists = lstatExists(full);
-    if (isSymlinkPath(full)) return .{ .status = "skipped-symlink", .label = "!" };
-    if (target_exists and !isRegularFile(full)) return .{ .status = "skipped-non-file", .label = "?" };
-    if (unsafeParent(gpa, full, opts.target)) return .{ .status = "skipped-unsafe-parent", .label = "!" };
+    const target_exists = lstatExists(io, full);
+    if (isSymlinkPath(io, full)) return .{ .status = "skipped-symlink", .label = "!" };
+    if (target_exists and !isRegularFile(io, full)) return .{ .status = "skipped-non-file", .label = "?" };
+    if (unsafeParent(io, gpa, full, opts.target)) return .{ .status = "skipped-unsafe-parent", .label = "!" };
 
     if (!target_exists) {
         if (!opts.dry_run) {
             const body = try agentBody(gpa, agent);
             defer gpa.free(body);
-            writeFileSafe(gpa, full, body, opts.target) catch |e| {
+            writeFileSafe(io, gpa, full, body, opts.target) catch |e| {
                 return mapWriteErr(e);
             };
         }
         return .{ .status = "added", .label = "+" };
     }
 
-    const existing = readWholeFile(gpa, full) orelse return .{ .status = "skipped-non-file", .label = "?" };
+    const existing = readWholeFile(io, gpa, full) orelse return .{ .status = "skipped-non-file", .label = "?" };
     defer gpa.free(existing);
 
     if (agent.mode == .import_agents and hasAgentsImport(existing)) {
@@ -353,7 +337,7 @@ fn processAgent(gpa: std.mem.Allocator, agent: Agent, opts: *const Opts) !Result
             const sep = appendSeparator(existing);
             const merged = try std.fmt.allocPrint(gpa, "{s}{s}{s}", .{ existing, sep, body });
             defer gpa.free(merged);
-            writeFileSafe(gpa, full, merged, opts.target) catch |e| return mapWriteErr(e);
+            writeFileSafe(io, gpa, full, merged, opts.target) catch |e| return mapWriteErr(e);
         }
         return .{ .status = "appended", .label = "~" };
     }
@@ -362,7 +346,7 @@ fn processAgent(gpa: std.mem.Allocator, agent: Agent, opts: *const Opts) !Result
         if (!opts.dry_run) {
             const body = try agentBody(gpa, agent);
             defer gpa.free(body);
-            writeFileSafe(gpa, full, body, opts.target) catch |e| return mapWriteErr(e);
+            writeFileSafe(io, gpa, full, body, opts.target) catch |e| return mapWriteErr(e);
         }
         return .{ .status = "overwritten", .label = "!" };
     }
@@ -474,6 +458,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
 
+    // Construct the std.Io backend once; thread it down to every FS fn.
+    var threaded = common.threaded();
+    defer threaded.deinit();
+    const io = threaded.io();
+
     // Collect argv (after argv0) so the parse loop can do its --only lookahead.
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
@@ -547,7 +536,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var skipped: usize = 0;
 
     for (selected.items) |agent| {
-        const result = try processAgent(gpa, agent, &opts);
+        const result = try processAgent(io, gpa, agent, &opts);
         const target = agent.file orelse result.detail orelse agent.description orelse agent.id;
 
         var line: std.ArrayList(u8) = .empty;
@@ -671,17 +660,17 @@ test {
     testing.refAllDecls(common);
 }
 
-fn tmpRepo(gpa: std.mem.Allocator) ![]u8 {
+fn tmpRepo(io: std.Io, gpa: std.mem.Allocator) ![]u8 {
     const base = common.getenv("TMPDIR") orelse "/tmp";
     const dir = try std.fmt.allocPrint(gpa, "{s}/caveman-init-zig.{d}.{d}", .{ base, c.getpid(), common.nowMillis() });
-    var db: [std.fs.max_path_bytes]u8 = undefined;
-    @memcpy(db[0..dir.len], dir);
-    db[dir.len] = 0;
-    _ = c.mkdir(@ptrCast(db[0..dir.len :0].ptr), 0o755);
+    // STDLIB FIRST: single-level mkdir 0755 via std.Io.Dir.createDir (best-effort,
+    // ignore AlreadyExists / races — same as the old c.mkdir whose return we dropped).
+    const perms: std.Io.File.Permissions = if (is_windows) .default_dir else .fromMode(0o755);
+    std.Io.Dir.cwd().createDir(io, dir, perms) catch {};
     return dir;
 }
 
-fn runDefaults(gpa: std.mem.Allocator, target: []const u8, opts_in: Opts) !struct { added: usize, appended: usize, overwritten: usize, skipped: usize } {
+fn runDefaults(io: std.Io, gpa: std.mem.Allocator, target: []const u8, opts_in: Opts) !struct { added: usize, appended: usize, overwritten: usize, skipped: usize } {
     var opts = opts_in;
     opts.target = target;
     var selected: std.ArrayList(Agent) = .empty;
@@ -692,7 +681,7 @@ fn runDefaults(gpa: std.mem.Allocator, target: []const u8, opts_in: Opts) !struc
     var overwritten: usize = 0;
     var skipped: usize = 0;
     for (selected.items) |agent| {
-        const r = try processAgent(gpa, agent, &opts);
+        const r = try processAgent(io, gpa, agent, &opts);
         if (std.mem.eql(u8, r.status, "added") or std.mem.eql(u8, r.status, "would-add") or std.mem.eql(u8, r.status, "installed")) {
             added += 1;
         } else if (std.mem.eql(u8, r.status, "appended")) {
@@ -706,98 +695,110 @@ fn runDefaults(gpa: std.mem.Allocator, target: []const u8, opts_in: Opts) !struc
     return .{ .added = added, .appended = appended, .overwritten = overwritten, .skipped = skipped };
 }
 
-fn readFileZ(gpa: std.mem.Allocator, target: []const u8, rel: []const u8) !?[]u8 {
+fn readFileZ(io: std.Io, gpa: std.mem.Allocator, target: []const u8, rel: []const u8) !?[]u8 {
     const full = try std.fs.path.join(gpa, &.{ target, rel });
     defer gpa.free(full);
-    return common.readFileAlloc(gpa, full, 1024 * 1024);
+    return common.readFileAlloc(io, gpa, full, 1024 * 1024);
 }
 
-fn exists(gpa: std.mem.Allocator, target: []const u8, rel: []const u8) !bool {
+fn exists(io: std.Io, gpa: std.mem.Allocator, target: []const u8, rel: []const u8) !bool {
     const full = try std.fs.path.join(gpa, &.{ target, rel });
     defer gpa.free(full);
-    return common.classify(full) != .missing;
+    return common.classify(io, full) != .missing;
 }
 
 test "greenfield: creates all default rule files with frontmatter" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
-    const counts = try runDefaults(gpa, tmp, .{});
+    const counts = try runDefaults(io, gpa, tmp, .{});
     // 6 default file targets + openclaw installer (unsupported-standalone → skipped).
     try testing.expectEqual(@as(usize, 6), counts.added);
 
-    const cursor = (try readFileZ(gpa, tmp, ".cursor/rules/caveman.mdc")).?;
+    const cursor = (try readFileZ(io, gpa, tmp, ".cursor/rules/caveman.mdc")).?;
     defer gpa.free(cursor);
     try testing.expect(std.mem.indexOf(u8, cursor, "alwaysApply: true") != null);
     try testing.expect(std.mem.indexOf(u8, cursor, SENTINEL) != null);
 
-    const windsurf = (try readFileZ(gpa, tmp, ".windsurf/rules/caveman.md")).?;
+    const windsurf = (try readFileZ(io, gpa, tmp, ".windsurf/rules/caveman.md")).?;
     defer gpa.free(windsurf);
     try testing.expect(std.mem.indexOf(u8, windsurf, "trigger: always_on") != null);
 
-    const cline = (try readFileZ(gpa, tmp, ".clinerules/caveman.md")).?;
+    const cline = (try readFileZ(io, gpa, tmp, ".clinerules/caveman.md")).?;
     defer gpa.free(cline);
     try testing.expect(std.mem.startsWith(u8, cline, "Respond terse"));
 
-    const copilot = (try readFileZ(gpa, tmp, ".github/copilot-instructions.md")).?;
+    const copilot = (try readFileZ(io, gpa, tmp, ".github/copilot-instructions.md")).?;
     defer gpa.free(copilot);
     try testing.expect(std.mem.indexOf(u8, copilot, "Respond terse") != null);
 
-    const agents = (try readFileZ(gpa, tmp, "AGENTS.md")).?;
+    const agents = (try readFileZ(io, gpa, tmp, "AGENTS.md")).?;
     defer gpa.free(agents);
     try testing.expect(std.mem.indexOf(u8, agents, "Respond terse") != null);
 
-    const opencode = (try readFileZ(gpa, tmp, ".opencode/AGENTS.md")).?;
+    const opencode = (try readFileZ(io, gpa, tmp, ".opencode/AGENTS.md")).?;
     defer gpa.free(opencode);
     try testing.expect(std.mem.indexOf(u8, opencode, "Respond terse") != null);
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "idempotent: re-run skips all default file targets" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
-    _ = try runDefaults(gpa, tmp, .{});
-    const counts = try runDefaults(gpa, tmp, .{});
+    _ = try runDefaults(io, gpa, tmp, .{});
+    const counts = try runDefaults(io, gpa, tmp, .{});
     try testing.expectEqual(@as(usize, 0), counts.added);
     // 6 repo files skipped-already-installed + openclaw unsupported-standalone.
     try testing.expectEqual(@as(usize, 7), counts.skipped);
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "append mode: existing AGENTS.md gets caveman appended not replaced" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     const agents_path = try std.fs.path.join(gpa, &.{ tmp, "AGENTS.md" });
     defer gpa.free(agents_path);
-    try common.writeSmall(agents_path, "# My project\n\nDo not delete me.\n");
+    try common.writeSmall(io, agents_path, "# My project\n\nDo not delete me.\n");
 
-    _ = try runDefaults(gpa, tmp, .{});
-    const agents = (try readFileZ(gpa, tmp, "AGENTS.md")).?;
+    _ = try runDefaults(io, gpa, tmp, .{});
+    const agents = (try readFileZ(io, gpa, tmp, "AGENTS.md")).?;
     defer gpa.free(agents);
     try testing.expect(std.mem.indexOf(u8, agents, "Do not delete me") != null);
     try testing.expect(std.mem.indexOf(u8, agents, SENTINEL) != null);
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "skip mode: existing .cursor rule not overwritten without --force" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     const dir = try std.fs.path.join(gpa, &.{ tmp, ".cursor", "rules" });
     defer gpa.free(dir);
-    mkdirP(dir);
+    mkdirP(io, dir);
     const file = try std.fs.path.join(gpa, &.{ dir, "caveman.mdc" });
     defer gpa.free(file);
-    try common.writeSmall(file, "# original\nDo not delete me.\n");
+    try common.writeSmall(io, file, "# original\nDo not delete me.\n");
 
     var opts: Opts = .{ .target = tmp };
     try opts.only.append(gpa, "cursor");
@@ -806,27 +807,30 @@ test "skip mode: existing .cursor rule not overwritten without --force" {
     var selected: std.ArrayList(Agent) = .empty;
     defer selected.deinit(gpa);
     try resolveAgents(gpa, opts.only.items, &selected);
-    const r = try processAgent(gpa, selected.items[0], &opts);
+    const r = try processAgent(io, gpa, selected.items[0], &opts);
     try testing.expectEqualStrings("skipped-exists", r.status);
 
-    const after = (try readFileZ(gpa, tmp, ".cursor/rules/caveman.mdc")).?;
+    const after = (try readFileZ(io, gpa, tmp, ".cursor/rules/caveman.mdc")).?;
     defer gpa.free(after);
     try testing.expectEqualStrings("# original\nDo not delete me.\n", after);
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "--force overwrites existing rule file" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     const dir = try std.fs.path.join(gpa, &.{ tmp, ".cursor", "rules" });
     defer gpa.free(dir);
-    mkdirP(dir);
+    mkdirP(io, dir);
     const file = try std.fs.path.join(gpa, &.{ dir, "caveman.mdc" });
     defer gpa.free(file);
-    try common.writeSmall(file, "# original\n");
+    try common.writeSmall(io, file, "# original\n");
 
     var opts: Opts = .{ .target = tmp, .force = true };
     try opts.only.append(gpa, "cursor");
@@ -834,120 +838,138 @@ test "--force overwrites existing rule file" {
     var selected: std.ArrayList(Agent) = .empty;
     defer selected.deinit(gpa);
     try resolveAgents(gpa, opts.only.items, &selected);
-    const r = try processAgent(gpa, selected.items[0], &opts);
+    const r = try processAgent(io, gpa, selected.items[0], &opts);
     try testing.expectEqualStrings("overwritten", r.status);
 
-    const after = (try readFileZ(gpa, tmp, ".cursor/rules/caveman.mdc")).?;
+    const after = (try readFileZ(io, gpa, tmp, ".cursor/rules/caveman.mdc")).?;
     defer gpa.free(after);
     try testing.expect(std.mem.indexOf(u8, after, "alwaysApply: true") != null);
     try testing.expect(std.mem.indexOf(u8, after, "Respond terse") != null);
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "--dry-run announces but writes nothing" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
-    const counts = try runDefaults(gpa, tmp, .{ .dry_run = true });
+    const counts = try runDefaults(io, gpa, tmp, .{ .dry_run = true });
     try testing.expectEqual(@as(usize, 6), counts.added);
-    try testing.expect(!(try exists(gpa, tmp, ".cursor")));
-    try testing.expect(!(try exists(gpa, tmp, ".windsurf")));
-    try testing.expect(!(try exists(gpa, tmp, ".clinerules")));
-    try testing.expect(!(try exists(gpa, tmp, ".github/copilot-instructions.md")));
-    try testing.expect(!(try exists(gpa, tmp, ".opencode")));
-    try testing.expect(!(try exists(gpa, tmp, "AGENTS.md")));
+    try testing.expect(!(try exists(io, gpa, tmp, ".cursor")));
+    try testing.expect(!(try exists(io, gpa, tmp, ".windsurf")));
+    try testing.expect(!(try exists(io, gpa, tmp, ".clinerules")));
+    try testing.expect(!(try exists(io, gpa, tmp, ".github/copilot-instructions.md")));
+    try testing.expect(!(try exists(io, gpa, tmp, ".opencode")));
+    try testing.expect(!(try exists(io, gpa, tmp, "AGENTS.md")));
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "--only cline filters to one target" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     var opts: Opts = .{ .target = tmp };
     try opts.only.append(gpa, "cline");
     defer opts.only.deinit(gpa);
-    const counts = try runDefaults(gpa, tmp, opts);
+    const counts = try runDefaults(io, gpa, tmp, opts);
     try testing.expectEqual(@as(usize, 1), counts.added);
-    try testing.expect(try exists(gpa, tmp, ".clinerules/caveman.md"));
-    try testing.expect(!(try exists(gpa, tmp, ".cursor")));
+    try testing.expect(try exists(io, gpa, tmp, ".clinerules/caveman.md"));
+    try testing.expect(!(try exists(io, gpa, tmp, ".cursor")));
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "--only codex-app writes universal contract + agents skill + codex skill" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     var opts: Opts = .{ .target = tmp };
     try opts.only.append(gpa, "codex-app");
     defer opts.only.deinit(gpa);
-    const counts = try runDefaults(gpa, tmp, opts);
+    const counts = try runDefaults(io, gpa, tmp, opts);
     try testing.expectEqual(@as(usize, 3), counts.added);
-    try testing.expect(try exists(gpa, tmp, "AGENTS.md"));
-    try testing.expect(try exists(gpa, tmp, ".agents/skills/caveman/SKILL.md"));
+    try testing.expect(try exists(io, gpa, tmp, "AGENTS.md"));
+    try testing.expect(try exists(io, gpa, tmp, ".agents/skills/caveman/SKILL.md"));
 
-    const skill = (try readFileZ(gpa, tmp, ".codex/skills/caveman/SKILL.md")).?;
+    const skill = (try readFileZ(io, gpa, tmp, ".codex/skills/caveman/SKILL.md")).?;
     defer gpa.free(skill);
     try testing.expect(std.mem.startsWith(u8, skill, "---\nname: caveman"));
     try testing.expect(std.mem.indexOf(u8, skill, SENTINEL) != null);
-    try testing.expect(!(try exists(gpa, tmp, ".cursor")));
+    try testing.expect(!(try exists(io, gpa, tmp, ".cursor")));
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "--only walcode writes universal, claw, agents skill, codex skill" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     var opts: Opts = .{ .target = tmp };
     try opts.only.append(gpa, "walcode");
     defer opts.only.deinit(gpa);
-    const counts = try runDefaults(gpa, tmp, opts);
+    const counts = try runDefaults(io, gpa, tmp, opts);
     try testing.expectEqual(@as(usize, 4), counts.added);
-    try testing.expect(try exists(gpa, tmp, "AGENTS.md"));
-    try testing.expect(try exists(gpa, tmp, ".agents/skills/caveman/SKILL.md"));
-    try testing.expect(try exists(gpa, tmp, ".codex/skills/caveman/SKILL.md"));
-    const instr = (try readFileZ(gpa, tmp, ".claw/instructions.md")).?;
+    try testing.expect(try exists(io, gpa, tmp, "AGENTS.md"));
+    try testing.expect(try exists(io, gpa, tmp, ".agents/skills/caveman/SKILL.md"));
+    try testing.expect(try exists(io, gpa, tmp, ".codex/skills/caveman/SKILL.md"));
+    const instr = (try readFileZ(io, gpa, tmp, ".claw/instructions.md")).?;
     defer gpa.free(instr);
     try testing.expect(std.mem.indexOf(u8, instr, SENTINEL) != null);
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "--only claude-desktop writes AGENTS.md, CLAUDE.md import, claude skill" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     var opts: Opts = .{ .target = tmp };
     try opts.only.append(gpa, "claude-desktop");
     defer opts.only.deinit(gpa);
-    const counts = try runDefaults(gpa, tmp, opts);
+    const counts = try runDefaults(io, gpa, tmp, opts);
     try testing.expectEqual(@as(usize, 4), counts.added);
-    try testing.expect(try exists(gpa, tmp, "AGENTS.md"));
-    try testing.expect(try exists(gpa, tmp, ".agents/skills/caveman/SKILL.md"));
-    const claude = (try readFileZ(gpa, tmp, "CLAUDE.md")).?;
+    try testing.expect(try exists(io, gpa, tmp, "AGENTS.md"));
+    try testing.expect(try exists(io, gpa, tmp, ".agents/skills/caveman/SKILL.md"));
+    const claude = (try readFileZ(io, gpa, tmp, "CLAUDE.md")).?;
     defer gpa.free(claude);
     try testing.expect(std.mem.startsWith(u8, claude, "@AGENTS.md"));
-    try testing.expect(try exists(gpa, tmp, ".claude/skills/caveman/SKILL.md"));
+    try testing.expect(try exists(io, gpa, tmp, ".claude/skills/caveman/SKILL.md"));
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "CLAUDE.md import idempotent when @AGENTS.md present" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     const cl = try std.fs.path.join(gpa, &.{ tmp, "CLAUDE.md" });
     defer gpa.free(cl);
-    try common.writeSmall(cl, "@AGENTS.md\n\n## Claude-only\nKeep this.\n");
+    try common.writeSmall(io, cl, "@AGENTS.md\n\n## Claude-only\nKeep this.\n");
 
     var opts: Opts = .{ .target = tmp };
     try opts.only.append(gpa, "claude-code");
@@ -958,7 +980,7 @@ test "CLAUDE.md import idempotent when @AGENTS.md present" {
     // claude-code maps to agents + claude-import + claude-skill; find the import one.
     var saw_skip = false;
     for (selected.items) |agent| {
-        const r = try processAgent(gpa, agent, &opts);
+        const r = try processAgent(io, gpa, agent, &opts);
         if (agent.mode == .import_agents) {
             try testing.expectEqualStrings("skipped-already-installed", r.status);
             saw_skip = true;
@@ -966,21 +988,24 @@ test "CLAUDE.md import idempotent when @AGENTS.md present" {
     }
     try testing.expect(saw_skip);
     // Exactly one @AGENTS.md still.
-    const claude = (try readFileZ(gpa, tmp, "CLAUDE.md")).?;
+    const claude = (try readFileZ(io, gpa, tmp, "CLAUDE.md")).?;
     defer gpa.free(claude);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, claude, "@AGENTS.md"));
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "CLAUDE.md import appends when legacy caveman text lacks @AGENTS.md" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     const cl = try std.fs.path.join(gpa, &.{ tmp, "CLAUDE.md" });
     defer gpa.free(cl);
-    try common.writeSmall(cl, "## Legacy\nRespond terse like smart caveman. Keep this.\n");
+    try common.writeSmall(io, cl, "## Legacy\nRespond terse like smart caveman. Keep this.\n");
 
     var opts: Opts = .{ .target = tmp };
     try opts.only.append(gpa, "claude-code");
@@ -990,40 +1015,41 @@ test "CLAUDE.md import appends when legacy caveman text lacks @AGENTS.md" {
     try resolveAgents(gpa, opts.only.items, &selected);
     var saw_append = false;
     for (selected.items) |agent| {
-        const r = try processAgent(gpa, agent, &opts);
+        const r = try processAgent(io, gpa, agent, &opts);
         if (agent.mode == .import_agents) {
             try testing.expectEqualStrings("appended", r.status);
             saw_append = true;
         }
     }
     try testing.expect(saw_append);
-    const claude = (try readFileZ(gpa, tmp, "CLAUDE.md")).?;
+    const claude = (try readFileZ(io, gpa, tmp, "CLAUDE.md")).?;
     defer gpa.free(claude);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, claude, "@AGENTS.md"));
     try testing.expect(std.mem.indexOf(u8, claude, "Respond terse like smart caveman") != null);
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "safety: refuses to write through existing symlink target" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     const outside = try std.fmt.allocPrint(gpa, "{s}-outside.md", .{tmp});
     defer gpa.free(outside);
-    try common.writeSmall(outside, "outside stays unchanged\n");
+    try common.writeSmall(io, outside, "outside stays unchanged\n");
 
     const agents_link = try std.fs.path.join(gpa, &.{ tmp, "AGENTS.md" });
     defer gpa.free(agents_link);
-    var ob: [std.fs.max_path_bytes]u8 = undefined;
-    var lb: [std.fs.max_path_bytes]u8 = undefined;
-    if (c.symlink(try common.toZ(&ob, outside), try common.toZ(&lb, agents_link)) != 0) {
+    std.Io.Dir.cwd().symLink(io, outside, agents_link, .{}) catch {
         // symlink unsupported on this fs — skip gracefully.
-        cleanup(tmp);
-        _ = c.unlink(try common.toZ(&ob, outside));
+        cleanup(io, tmp);
+        std.Io.Dir.cwd().deleteFile(io, outside) catch {};
         return;
-    }
+    };
 
     var opts: Opts = .{ .target = tmp };
     try opts.only.append(gpa, "antigravity-app");
@@ -1033,39 +1059,40 @@ test "safety: refuses to write through existing symlink target" {
     try resolveAgents(gpa, opts.only.items, &selected);
     var saw_symlink_skip = false;
     for (selected.items) |agent| {
-        const r = try processAgent(gpa, agent, &opts);
+        const r = try processAgent(io, gpa, agent, &opts);
         if (agent.mode == .append and agent.file != null and std.mem.eql(u8, agent.file.?, "AGENTS.md")) {
             try testing.expectEqualStrings("skipped-symlink", r.status);
             saw_symlink_skip = true;
         }
     }
     try testing.expect(saw_symlink_skip);
-    const od = try common.readSmall(gpa, outside);
+    const od = try common.readSmall(io, gpa, outside);
     defer gpa.free(od);
     try testing.expectEqualStrings("outside stays unchanged\n", od);
 
-    _ = c.unlink(try common.toZ(&lb, agents_link));
-    _ = c.unlink(try common.toZ(&ob, outside));
-    cleanup(tmp);
+    std.Io.Dir.cwd().deleteFile(io, agents_link) catch {};
+    std.Io.Dir.cwd().deleteFile(io, outside) catch {};
+    cleanup(io, tmp);
 }
 
 test "safety: refuses to write through symlinked parent directory" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     const outside_dir = try std.fmt.allocPrint(gpa, "{s}-outdir", .{tmp});
     defer gpa.free(outside_dir);
-    mkdirP(outside_dir);
+    mkdirP(io, outside_dir);
 
     const codex_link = try std.fs.path.join(gpa, &.{ tmp, ".codex" });
     defer gpa.free(codex_link);
-    var ob: [std.fs.max_path_bytes]u8 = undefined;
-    var lb: [std.fs.max_path_bytes]u8 = undefined;
-    if (c.symlink(try common.toZ(&ob, outside_dir), try common.toZ(&lb, codex_link)) != 0) {
-        cleanup(tmp);
+    std.Io.Dir.cwd().symLink(io, outside_dir, codex_link, .{}) catch {
+        cleanup(io, tmp);
         return;
-    }
+    };
 
     var opts: Opts = .{ .target = tmp };
     try opts.only.append(gpa, "codex-app");
@@ -1075,7 +1102,7 @@ test "safety: refuses to write through symlinked parent directory" {
     try resolveAgents(gpa, opts.only.items, &selected);
     var saw_unsafe = false;
     for (selected.items) |agent| {
-        const r = try processAgent(gpa, agent, &opts);
+        const r = try processAgent(io, gpa, agent, &opts);
         if (agent.mode == .skill and std.mem.eql(u8, agent.id, "codex-skill")) {
             try testing.expectEqualStrings("skipped-unsafe-parent", r.status);
             saw_unsafe = true;
@@ -1083,27 +1110,30 @@ test "safety: refuses to write through symlinked parent directory" {
     }
     try testing.expect(saw_unsafe);
     // AGENTS.md should still be written.
-    try testing.expect(try exists(gpa, tmp, "AGENTS.md"));
+    try testing.expect(try exists(io, gpa, tmp, "AGENTS.md"));
     // Skill should NOT be written through the parent symlink.
     const through = try std.fs.path.join(gpa, &.{ outside_dir, "skills", "caveman", "SKILL.md" });
     defer gpa.free(through);
-    try testing.expect(common.classify(through) == .missing);
+    try testing.expect(common.classify(io, through) == .missing);
 
-    _ = c.unlink(try common.toZ(&lb, codex_link));
-    cleanup(tmp);
+    std.Io.Dir.cwd().deleteFile(io, codex_link) catch {};
+    cleanup(io, tmp);
 }
 
 test "detects sentinel and skips already-installed files" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const tmp = try tmpRepo(gpa);
+    const tmp = try tmpRepo(io, gpa);
     defer gpa.free(tmp);
 
     const dir = try std.fs.path.join(gpa, &.{ tmp, ".clinerules" });
     defer gpa.free(dir);
-    mkdirP(dir);
+    mkdirP(io, dir);
     const file = try std.fs.path.join(gpa, &.{ dir, "caveman.md" });
     defer gpa.free(file);
-    try common.writeSmall(file, "# Existing\n\nRespond terse like smart caveman. Hello.\n");
+    try common.writeSmall(io, file, "# Existing\n\nRespond terse like smart caveman. Hello.\n");
 
     var opts: Opts = .{ .target = tmp };
     try opts.only.append(gpa, "cline");
@@ -1111,10 +1141,10 @@ test "detects sentinel and skips already-installed files" {
     var selected: std.ArrayList(Agent) = .empty;
     defer selected.deinit(gpa);
     try resolveAgents(gpa, opts.only.items, &selected);
-    const r = try processAgent(gpa, selected.items[0], &opts);
+    const r = try processAgent(io, gpa, selected.items[0], &opts);
     try testing.expectEqualStrings("skipped-already-installed", r.status);
 
-    cleanup(tmp);
+    cleanup(io, tmp);
 }
 
 test "unknown agent rejected" {
@@ -1135,46 +1165,12 @@ test "hasAgentsImport line anchors" {
     try testing.expect(!hasAgentsImport("@AGENTS.mdx\n"));
 }
 
-// Recursively remove a temp dir (best-effort, libc opendir/readdir). std.fs's
-// directory iterators route through the Io surface in this 0.16 build, so we
-// stay on the stable C ABI like the rest of the hook tree.
-extern "c" fn opendir(name: [*:0]const u8) ?*anyopaque;
-extern "c" fn readdir(dirp: *anyopaque) ?*Dirent;
-extern "c" fn closedir(dirp: *anyopaque) c_int;
-
-const Dirent = extern struct {
-    d_ino: u64,
-    d_seekoff: u64,
-    d_reclen: u16,
-    d_namlen: u16,
-    d_type: u8,
-    d_name: [1024]u8,
-};
-
-fn cleanup(path: []const u8) void {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = toZ(&pbuf, path) catch return;
-    const dirp = opendir(pz) orelse {
-        _ = c.rmdir(pz);
-        return;
-    };
-    var arena = std.heap.ArenaAllocator.init(std.heap.c_allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    while (readdir(dirp)) |ent| {
-        const name = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.d_name)), 0);
-        if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
-        const child = std.fs.path.join(a, &.{ path, name }) catch continue;
-        switch (common.classify(child)) {
-            .dir => cleanup(child),
-            else => {
-                var b: [std.fs.max_path_bytes]u8 = undefined;
-                if (toZ(&b, child)) |z| {
-                    _ = c.unlink(z);
-                } else |_| {}
-            },
-        }
-    }
-    _ = closedir(dirp);
-    _ = c.rmdir(pz);
+// Recursively remove a temp dir (best-effort). STDLIB FIRST: std.Io.Dir.deleteTree
+// is the recursive-removal primitive — for a path that is a file, symlink, or
+// directory it removes it, recursing into directory entries first. It does NOT
+// follow a symlink into its target (it unlinks the link itself), matching the old
+// classify-then-unlink behavior where symlinks fell into the `else` (unlink-in-place)
+// branch. Best-effort: every error is swallowed (the temp dir is throwaway).
+fn cleanup(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(io, path) catch {};
 }

@@ -11,6 +11,7 @@
 //! writes. libc C-ABI throughout (std.c).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const common = @import("common.zig");
 const openclaw = @import("openclaw.zig");
 const c = std.c;
@@ -53,16 +54,20 @@ pub const InstallResult = openclaw.InstallResult;
 ///   - `force`: when true, mkdir the workspace if missing.
 /// Mirrors the ordering, safety checks, and return reasons of the JS.
 pub fn installNullclaw(
+    io: std.Io,
     gpa: std.mem.Allocator,
     workspace: []const u8,
     skill_body: []const u8,
     dry_run: bool,
     force: bool,
 ) !InstallResult {
-    if (common.classify(workspace) == .missing) {
+    // Classify once: avoids 4 redundant lstat syscalls and takes a single atomic
+    // snapshot (no re-stat across the checks).
+    const ws_kind = common.classify(io, workspace);
+    if (ws_kind == .missing) {
         if (!force) return .{ .ok = false, .reason = "workspace missing" };
-        if (!dry_run and !mkdirP(workspace)) return .{ .ok = false, .reason = "unsafe target" };
-    } else if (common.classify(workspace) == .symlink or common.classify(workspace) == .other) {
+        if (!dry_run and !mkdirP(io, workspace)) return .{ .ok = false, .reason = "unsafe target" };
+    } else if (ws_kind == .symlink or ws_kind == .other) {
         return .{ .ok = false, .reason = "unsafe target" };
     }
 
@@ -71,42 +76,42 @@ pub fn installNullclaw(
     const skill_file = try std.fs.path.join(gpa, &.{ skill_dir, "SKILL.md" });
     defer gpa.free(skill_file);
 
-    if (common.isSymlink(skill_file)) return .{ .ok = false, .reason = "unsafe target" };
-    if (common.classify(skill_dir) == .symlink) return .{ .ok = false, .reason = "unsafe target" };
+    if (common.isSymlink(io, skill_file)) return .{ .ok = false, .reason = "unsafe target" };
+    if (common.classify(io, skill_dir) == .symlink) return .{ .ok = false, .reason = "unsafe target" };
     {
         const skills_parent = try std.fs.path.join(gpa, &.{ workspace, "skills" });
         defer gpa.free(skills_parent);
-        if (common.classify(skills_parent) == .symlink) return .{ .ok = false, .reason = "unsafe target" };
+        if (common.classify(io, skills_parent) == .symlink) return .{ .ok = false, .reason = "unsafe target" };
     }
     {
         const sd = std.fs.path.dirname(skill_file) orelse skill_dir;
-        if (common.ancestorUnsafe(sd)) return .{ .ok = false, .reason = "unsafe target" };
+        if (common.ancestorUnsafe(io, sd)) return .{ .ok = false, .reason = "unsafe target" };
     }
 
     if (dry_run) return .{ .ok = true };
 
     // skills/caveman/ is two levels under the workspace; common.safeWriteFlag
     // only mkdirs the immediate parent, so create the tree first.
-    if (!mkdirP(skill_dir)) return .{ .ok = false, .reason = "unsafe target" };
+    if (!mkdirP(io, skill_dir)) return .{ .ok = false, .reason = "unsafe target" };
 
     const merged = try openclaw.mergeOpenclawFrontmatter(gpa, skill_body);
     defer gpa.free(merged);
-    common.safeWriteFlag(gpa, skill_file, merged) catch return .{ .ok = false, .reason = "unsafe target" };
+    common.safeWriteFlag(io, gpa, skill_file, merged) catch return .{ .ok = false, .reason = "unsafe target" };
     return .{ .ok = true };
 }
 
 /// JS uninstallNullclaw: remove only the skill folder (SOUL.md untouched).
-pub fn uninstallNullclaw(gpa: std.mem.Allocator, workspace: []const u8, dry_run: bool) !void {
+pub fn uninstallNullclaw(io: std.Io, gpa: std.mem.Allocator, workspace: []const u8, dry_run: bool) !void {
     const skill_dir = try std.fs.path.join(gpa, &.{ workspace, "skills", SKILL_NAME });
     defer gpa.free(skill_dir);
-    if (common.classify(skill_dir) == .dir and !dry_run) {
-        openclaw.removeTree(gpa, skill_dir);
+    if (common.classify(io, skill_dir) == .dir and !dry_run) {
+        openclaw.removeTree(io, gpa, skill_dir);
     }
 }
 
 // ── Filesystem helpers (libc) ───────────────────────────────────────────────
-fn mkdirP(dir: []const u8) bool {
-    if (common.ancestorUnsafe(dir)) return false;
+fn mkdirP(io: std.Io, dir: []const u8) bool {
+    if (common.ancestorUnsafe(io, dir)) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     if (dir.len >= buf.len) return false;
     var i: usize = 0;
@@ -121,10 +126,10 @@ fn mkdirP(dir: []const u8) bool {
         }
         i = j + 1;
     }
-    return common.classify(dir) == .dir;
+    return common.classify(io, dir) == .dir;
 }
 
-// removeTree is shared via openclaw.removeTree (libc opendir/readdir + lstat).
+// removeTree is shared via openclaw.removeTree (libc opendir/readdir + std.Io classify).
 
 // ── Tests ────────────────────────────────────────────────────────────────────
 const testing = std.testing;
@@ -182,129 +187,138 @@ test "resolveWorkspace falls back to ~/.nullclaw/workspace" {
 }
 
 test "installNullclaw writes always-on skill, idempotent, uninstall removes folder" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
     const ws = try std.fs.path.join(gpa, &.{ dir_path, "null-ws" });
     defer gpa.free(ws);
-    try common.mkdirPath(ws);
+    try common.mkdirPath(io, ws);
 
     const skill_body = "---\ndescription: x\n---\nRespond terse like smart caveman.\n";
 
-    const r1 = try installNullclaw(gpa, ws, skill_body, false, false);
+    const r1 = try installNullclaw(io, gpa, ws, skill_body, false, false);
     try testing.expect(r1.ok);
 
     const skill_file = try std.fs.path.join(gpa, &.{ ws, "skills", "caveman", "SKILL.md" });
     defer gpa.free(skill_file);
-    const raw = common.readFileAlloc(gpa, skill_file, 1 << 20).?;
+    const raw = common.readFileAlloc(io, gpa, skill_file, 1 << 20).?;
     defer gpa.free(raw);
     try testing.expect(std.mem.indexOf(u8, raw, "name: caveman") != null);
     try testing.expect(std.mem.indexOf(u8, raw, "always: true") != null);
     try testing.expect(std.mem.indexOf(u8, raw, "Respond terse like smart caveman") != null);
 
     // idempotent re-run keeps exactly one always: key
-    const r2 = try installNullclaw(gpa, ws, skill_body, false, false);
+    const r2 = try installNullclaw(io, gpa, ws, skill_body, false, false);
     try testing.expect(r2.ok);
-    const raw2 = common.readFileAlloc(gpa, skill_file, 1 << 20).?;
+    const raw2 = common.readFileAlloc(io, gpa, skill_file, 1 << 20).?;
     defer gpa.free(raw2);
     try testing.expectEqual(@as(usize, 1), countOccurrences(raw2, "always: true"));
 
     // SOUL.md must NOT be written by nullclaw (unlike openclaw)
     const soul = try std.fs.path.join(gpa, &.{ ws, "SOUL.md" });
     defer gpa.free(soul);
-    try testing.expect(common.classify(soul) == .missing);
+    try testing.expect(common.classify(io, soul) == .missing);
 
     // uninstall removes only the skill folder
-    try uninstallNullclaw(gpa, ws, false);
+    try uninstallNullclaw(io, gpa, ws, false);
     const skill_dir = try std.fs.path.join(gpa, &.{ ws, "skills", "caveman" });
     defer gpa.free(skill_dir);
-    try testing.expect(common.classify(skill_dir) == .missing);
+    try testing.expect(common.classify(io, skill_dir) == .missing);
 }
 
 test "installNullclaw reports workspace missing without force" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
     const ws = try std.fs.path.join(gpa, &.{ dir_path, "no-ws" });
     defer gpa.free(ws);
 
     const skill_body = "---\ndescription: x\n---\nbody\n";
-    const r = try installNullclaw(gpa, ws, skill_body, false, false);
+    const r = try installNullclaw(io, gpa, ws, skill_body, false, false);
     try testing.expect(!r.ok);
     try testing.expectEqualStrings("workspace missing", r.reason);
 }
 
 test "installNullclaw refuses symlinked skill target" {
+    if (builtin.os.tag == .windows) return;
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
     const ws = try std.fs.path.join(gpa, &.{ dir_path, "null-ws2" });
     defer gpa.free(ws);
     const skill_dir = try std.fs.path.join(gpa, &.{ ws, "skills", "caveman" });
     defer gpa.free(skill_dir);
-    try common.mkdirPath(ws);
+    try common.mkdirPath(io, ws);
     {
         const skills = try std.fs.path.join(gpa, &.{ ws, "skills" });
         defer gpa.free(skills);
-        try common.mkdirPath(skills);
-        try common.mkdirPath(skill_dir);
+        try common.mkdirPath(io, skills);
+        try common.mkdirPath(io, skill_dir);
     }
 
     const outside = try std.fs.path.join(gpa, &.{ dir_path, "outside.md" });
     defer gpa.free(outside);
-    try common.writeSmall(outside, "outside stays\n");
+    try common.writeSmall(io, outside, "outside stays\n");
 
     const skill_file = try std.fs.path.join(gpa, &.{ skill_dir, "SKILL.md" });
     defer gpa.free(skill_file);
-    var ob: [std.fs.max_path_bytes]u8 = undefined;
-    var sb: [std.fs.max_path_bytes]u8 = undefined;
-    try testing.expect(c.symlink(try common.toZ(&ob, outside), try common.toZ(&sb, skill_file)) == 0);
+    std.Io.Dir.cwd().symLink(io, outside, skill_file, .{}) catch return error.SkipZigTest;
 
-    const r = try installNullclaw(gpa, ws, "---\nx: y\n---\nbody\n", false, false);
+    const r = try installNullclaw(io, gpa, ws, "---\nx: y\n---\nbody\n", false, false);
     try testing.expect(!r.ok);
     try testing.expectEqualStrings("unsafe target", r.reason);
-    const data = try common.readSmall(gpa, outside);
+    const data = try common.readSmall(io, gpa, outside);
     defer gpa.free(data);
     try testing.expectEqualStrings("outside stays\n", data);
 
-    _ = c.unlink(try common.toZ(&sb, skill_file));
-    _ = c.unlink(try common.toZ(&ob, outside));
+    common.unlinkFlag(io, skill_file);
+    common.unlinkFlag(io, outside);
 }
 
 test "uninstallNullclaw skips symlinked skill directory" {
+    if (builtin.os.tag == .windows) return;
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
     const ws = try std.fs.path.join(gpa, &.{ dir_path, "null-ws3" });
     defer gpa.free(ws);
     const skills = try std.fs.path.join(gpa, &.{ ws, "skills" });
     defer gpa.free(skills);
-    try common.mkdirPath(ws);
-    try common.mkdirPath(skills);
+    try common.mkdirPath(io, ws);
+    try common.mkdirPath(io, skills);
 
     const outside = try std.fs.path.join(gpa, &.{ dir_path, "outside-skill" });
     defer gpa.free(outside);
-    try common.mkdirPath(outside);
+    try common.mkdirPath(io, outside);
     const marker = try std.fs.path.join(gpa, &.{ outside, "marker.txt" });
     defer gpa.free(marker);
-    try common.writeSmall(marker, "keep\n");
+    try common.writeSmall(io, marker, "keep\n");
 
     const skill_dir = try std.fs.path.join(gpa, &.{ skills, "caveman" });
     defer gpa.free(skill_dir);
-    var ob: [std.fs.max_path_bytes]u8 = undefined;
-    var sb: [std.fs.max_path_bytes]u8 = undefined;
-    try testing.expect(c.symlink(try common.toZ(&ob, outside), try common.toZ(&sb, skill_dir)) == 0);
+    std.Io.Dir.cwd().symLink(io, outside, skill_dir, .{}) catch return error.SkipZigTest;
 
-    try uninstallNullclaw(gpa, ws, false);
-    try testing.expect(common.classify(skill_dir) == .symlink);
-    const data = try common.readSmall(gpa, marker);
+    try uninstallNullclaw(io, gpa, ws, false);
+    try testing.expect(common.classify(io, skill_dir) == .symlink);
+    const data = try common.readSmall(io, gpa, marker);
     defer gpa.free(data);
     try testing.expectEqualStrings("keep\n", data);
 
-    _ = c.unlink(try common.toZ(&sb, skill_dir));
-    var mb: [std.fs.max_path_bytes]u8 = undefined;
-    _ = c.unlink(try common.toZ(&mb, marker));
-    _ = c.rmdir(try common.toZ(&ob, outside));
+    common.unlinkFlag(io, skill_dir);
+    common.unlinkFlag(io, marker);
+    std.Io.Dir.cwd().deleteDir(io, outside) catch {};
 }
 
 fn countOccurrences(hay: []const u8, needle: []const u8) usize {

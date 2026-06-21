@@ -30,12 +30,12 @@
 const std = @import("std");
 const c = std.c;
 
-// libc C-ABI symbols not re-exported under std.c in this 0.16 build — declared
-// the same way common.zig does, so the detector stays on the stable C ABI like
-// the rest of the hooks (this 0.16 build removed std.fs.cwd() and
-// std.process.argsAlloc).
-extern "c" fn close(fd: c_int) c_int;
-extern "c" fn lstat(path: [*:0]const u8, buf: *c.Stat) c_int;
+// The detector's filesystem core (lstat / O_NOFOLLOW open / positional read)
+// runs entirely on the portable std.Io surface (R6a) so the binary
+// cross-compiles. The only libc that remains is `c.write(1/2, …)` for the
+// fd-based stdout/stderr writers — the stable C-ABI stdio convention shared by
+// common.zig and every sibling hook binary (compress_cmd, compress_validate,
+// compress_protect_cli). No raw lstat/open/read/close decls live here anymore.
 
 pub const FileType = enum {
     natural_language,
@@ -412,7 +412,7 @@ pub const DetectError = error{ReadFailed};
 /// detect_file_type(filepath) over a real path. Reads the file ONLY when the
 /// extension is absent (the Python content branch). Returns `.unknown` for the
 /// no-extension + read-failure case, matching the Python except clause.
-pub fn detectFileType(gpa: std.mem.Allocator, path: []const u8) FileType {
+pub fn detectFileType(io: std.Io, gpa: std.mem.Allocator, path: []const u8) FileType {
     switch (classifyByExt(path)) {
         .classified => |ft| return ft,
         .unknown_ext => return .unknown,
@@ -421,7 +421,7 @@ pub fn detectFileType(gpa: std.mem.Allocator, path: []const u8) FileType {
             // Python returns "unknown". 16 MiB cap is well beyond any prose file
             // and bounds memory; an over-cap read is treated as a read failure
             // (the file is not a normal text file we'd classify).
-            const raw = readFileLossy(gpa, path, 16 * 1024 * 1024) orelse return .unknown;
+            const raw = readFileLossy(io, gpa, path, 16 * 1024 * 1024) orelse return .unknown;
             defer gpa.free(raw);
             return detectFileTypeContent(gpa, raw);
         },
@@ -431,11 +431,11 @@ pub fn detectFileType(gpa: std.mem.Allocator, path: []const u8) FileType {
 /// should_compress(filepath): regular file, not a *.original.md backup, and
 /// detect_file_type == natural_language. The is_file() gate is checked by the
 /// caller's stat; here we re-check name + type. Pass `is_file` from an lstat.
-pub fn shouldCompress(gpa: std.mem.Allocator, path: []const u8, is_file: bool) bool {
+pub fn shouldCompress(io: std.Io, gpa: std.mem.Allocator, path: []const u8, is_file: bool) bool {
     if (!is_file) return false;
     const base = std.fs.path.basename(path);
     if (std.mem.endsWith(u8, base, ".original.md")) return false;
-    return detectFileType(gpa, path) == .natural_language;
+    return detectFileType(io, gpa, path) == .natural_language;
 }
 
 /// Copy a slice into a fixed NUL-terminated buffer for C calls (mirrors
@@ -453,37 +453,36 @@ fn toZ(buf: []u8, s: []const u8) ?[*:0]const u8 {
 /// rejects non-UTF-8, so we pass the raw bytes through unchanged. Opens with
 /// O_NOFOLLOW (refuse symlinks, like the rest of the hooks). Returns null on
 /// open/read failure or when the file exceeds `max_bytes`.
-fn readFileLossy(gpa: std.mem.Allocator, path: []const u8, max_bytes: usize) ?[]u8 {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = toZ(&pbuf, path) orelse return null;
-    const flags: c.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true };
-    const fd = c.open(pz, flags, @as(c.mode_t, 0));
-    if (fd < 0) return null;
-    defer _ = close(fd);
+fn readFileLossy(io: std.Io, gpa: std.mem.Allocator, path: []const u8, max_bytes: usize) ?[]u8 {
+    // O_NOFOLLOW (refuse symlinks) via std.Io — portable, cross-compiles.
+    var f = std.Io.Dir.cwd().openFile(io, path, .{ .follow_symlinks = false }) catch return null;
+    defer f.close(io);
 
     var out: std.ArrayList(u8) = .empty;
     var buf: [4096]u8 = undefined;
+    var offset: u64 = 0;
     while (out.items.len <= max_bytes) {
-        const n = c.read(fd, &buf, buf.len);
-        if (n < 0) {
+        var iov = [_][]u8{&buf};
+        const n = f.readPositional(io, &iov, offset) catch {
             out.deinit(gpa);
             return null;
-        }
+        };
         if (n == 0) {
             return out.toOwnedSlice(gpa) catch {
                 out.deinit(gpa);
                 return null;
             };
         }
-        const grown = out.items.len + @as(usize, @intCast(n));
+        const grown = out.items.len + n;
         if (grown > max_bytes) {
             out.deinit(gpa);
             return null;
         }
-        out.appendSlice(gpa, buf[0..@intCast(n)]) catch {
+        out.appendSlice(gpa, buf[0..n]) catch {
             out.deinit(gpa);
             return null;
         };
+        offset += n;
     }
     out.deinit(gpa);
     return null;
@@ -529,8 +528,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    // No-alloc POSIX arg iterator (init.args) — keeps us on the libc C-ABI
-    // surface, no std.Io. Mirrors stats.zig's sessionFileArg pattern.
+    // Construct the std.Io backend once; thread it down to every FS fn. This
+    // module has no common.zig dependency (it's imported BY common's consumers),
+    // so construct Threaded directly here.
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // No-alloc POSIX arg iterator (init.args) for argv reading.
     var it = init.args.iterate();
     defer it.deinit();
     _ = it.skip(); // argv[0]
@@ -548,9 +553,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // also keeps us off the removed std.fs cwd surface.)
         const name = std.fs.path.basename(path_str);
 
-        const ft = detectFileType(gpa, path_str);
-        const is_file = isRegularFile(path_str);
-        const compress = shouldCompress(gpa, path_str, is_file);
+        const ft = detectFileType(io, gpa, path_str);
+        const is_file = isRegularFile(io, path_str);
+        const compress = shouldCompress(io, gpa, path_str, is_file);
 
         const line = try formatLine(gpa, name, ft, compress);
         defer gpa.free(line);
@@ -571,12 +576,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
 /// (a symlink to a regular file would be is_file()==True in Python, but our
 /// hooks deliberately refuse symlinks everywhere — documented divergence that
 /// only affects symlinked inputs).
-fn isRegularFile(path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(&buf, path) orelse return false;
-    var st: c.Stat = undefined;
-    if (lstat(z, &st) != 0) return false;
-    return (st.mode & c.S.IFMT) == c.S.IFREG;
+fn isRegularFile(io: std.Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return false;
+    return st.kind == .file;
 }
 
 fn writeStdout(bytes: []const u8) void {
@@ -625,12 +627,15 @@ test "classifyByExt: compressible / code / config / unknown / none" {
 }
 
 test "detectFileType: extension table classification" {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const gpa = testing.allocator;
-    try testing.expectEqual(FileType.natural_language, detectFileType(gpa, "README.md"));
-    try testing.expectEqual(FileType.code, detectFileType(gpa, "server.go"));
-    try testing.expectEqual(FileType.config, detectFileType(gpa, "Cargo.toml"));
-    try testing.expectEqual(FileType.config, detectFileType(gpa, "app.ini"));
-    try testing.expectEqual(FileType.unknown, detectFileType(gpa, "image.png"));
+    try testing.expectEqual(FileType.natural_language, detectFileType(io, gpa, "README.md"));
+    try testing.expectEqual(FileType.code, detectFileType(io, gpa, "server.go"));
+    try testing.expectEqual(FileType.config, detectFileType(io, gpa, "Cargo.toml"));
+    try testing.expectEqual(FileType.config, detectFileType(io, gpa, "app.ini"));
+    try testing.expectEqual(FileType.unknown, detectFileType(io, gpa, "image.png"));
 }
 
 test "detectFileTypeContent: JSON → config" {
@@ -703,15 +708,18 @@ test "yamlKeyShape: requires ws after colon" {
 }
 
 test "shouldCompress: backups and types" {
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     const gpa = testing.allocator;
     // *.original.md is always skipped even though .md is compressible.
-    try testing.expect(!shouldCompress(gpa, "doc.original.md", true));
+    try testing.expect(!shouldCompress(io, gpa, "doc.original.md", true));
     // not a file → false.
-    try testing.expect(!shouldCompress(gpa, "README.md", false));
+    try testing.expect(!shouldCompress(io, gpa, "README.md", false));
     // a .md regular file → compressible.
-    try testing.expect(shouldCompress(gpa, "README.md", true));
+    try testing.expect(shouldCompress(io, gpa, "README.md", true));
     // a .py regular file → not compressible.
-    try testing.expect(!shouldCompress(gpa, "main.py", true));
+    try testing.expect(!shouldCompress(io, gpa, "main.py", true));
 }
 
 test "formatLine: matches the Python f-string layout" {

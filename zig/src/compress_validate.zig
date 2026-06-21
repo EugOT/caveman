@@ -753,33 +753,26 @@ pub fn validate(gpa: Allocator, orig: []const u8, comp: []const u8) Allocator.Er
 
 const MAX_FILE_BYTES = 16 * 1024 * 1024; // generous cap; markdown docs are tiny
 
-/// Read a file fully into an owned buffer via the libc C ABI. validate.py reads
-/// with errors="ignore" (a decode concern); we read raw bytes (markdown is
-/// ASCII/UTF-8 and we never decode). std.fs.cwd() is gone in this 0.16 build, so
-/// — like common.zig's readFileAlloc — we go straight to libc open/read. Returns
-/// error.OpenFailed on a missing/unreadable file so the CLI prints usage.
-fn readFile(gpa: Allocator, path: []const u8) ![]u8 {
-    const c = std.c;
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len + 1 > pbuf.len) return error.PathTooLong;
-    @memcpy(pbuf[0..path.len], path);
-    pbuf[path.len] = 0;
-    const pz: [*:0]const u8 = @ptrCast(&pbuf);
-
-    const flags: c.O = .{ .ACCMODE = .RDONLY };
-    const fd = c.open(pz, flags, @as(c.mode_t, 0));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = std.c.close(fd);
+/// Read a file fully into an owned buffer via std.Io. validate.py reads with
+/// errors="ignore" (a decode concern); we read raw bytes (markdown is ASCII/UTF-8
+/// and we never decode). std.Io openFile/readPositional so the binary
+/// cross-compiles. Returns error.OpenFailed on a missing/unreadable file so the
+/// CLI prints usage.
+fn readFile(io: std.Io, gpa: Allocator, path: []const u8) ![]u8 {
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.OpenFailed;
+    defer f.close(io);
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     var buf: [4096]u8 = undefined;
+    var offset: u64 = 0;
     while (true) {
-        const n = c.read(fd, &buf, buf.len);
-        if (n < 0) return error.ReadFailed;
+        var iov = [_][]u8{&buf};
+        const n = f.readPositional(io, &iov, offset) catch return error.ReadFailed;
         if (n == 0) break;
-        if (out.items.len + @as(usize, @intCast(n)) > MAX_FILE_BYTES) return error.FileTooLarge;
-        try out.appendSlice(gpa, buf[0..@intCast(n)]);
+        if (out.items.len + n > MAX_FILE_BYTES) return error.FileTooLarge;
+        try out.appendSlice(gpa, buf[0..n]);
+        offset += n;
     }
     return out.toOwnedSlice(gpa);
 }
@@ -788,6 +781,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
+
+    // Construct the std.Io backend once; thread it down to every FS fn. This
+    // module has no common.zig dependency, so construct Threaded directly.
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
     // Collect positional argv (after argv0) into a slice — mirrors the
     // settings.zig CLI: init.args is a std.process.Args iterator, not a slice.
@@ -807,17 +806,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     if (argv.items.len != 2) {
-        writeOut("Usage: caveman-compress-validate <original> <compressed>\n");
+        writeOut(io, "Usage: caveman-compress-validate <original> <compressed>\n");
         std.process.exit(1);
     }
 
-    const orig = readFile(gpa, argv.items[0]) catch {
-        writeOut("Usage: caveman-compress-validate <original> <compressed>\n");
+    const orig = readFile(io, gpa, argv.items[0]) catch {
+        writeOut(io, "Usage: caveman-compress-validate <original> <compressed>\n");
         std.process.exit(1);
     };
     defer gpa.free(orig);
-    const comp = readFile(gpa, argv.items[1]) catch {
-        writeOut("Usage: caveman-compress-validate <original> <compressed>\n");
+    const comp = readFile(io, gpa, argv.items[1]) catch {
+        writeOut(io, "Usage: caveman-compress-validate <original> <compressed>\n");
         std.process.exit(1);
     };
     defer gpa.free(comp);
@@ -827,17 +826,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const block = try result.render(gpa);
     defer gpa.free(block);
-    writeOut(block);
+    writeOut(io, block);
 }
 
-fn writeOut(bytes: []const u8) void {
-    const c = std.c;
-    var written: usize = 0;
-    while (written < bytes.len) {
-        const n = c.write(1, bytes.ptr + written, bytes.len - written);
-        if (n <= 0) return;
-        written += @intCast(n);
-    }
+/// Write to stdout through std.Io. Stdout is a stream (not seekable), so use the
+/// portable streaming write off std.Io.File.stdout() rather than a raw libc
+/// c.write(1, …). On Windows the libc write() fd arg is a pointer type
+/// (fd_t == *anyopaque), so the literal `1` fails the x86_64-windows-gnu
+/// cross-compile; the std.Io path resolves stdout from the PEB on Windows and
+/// STDOUT_FILENO on POSIX. Silent on anomaly, matching the prior libc behavior.
+fn writeOut(io: std.Io, bytes: []const u8) void {
+    std.Io.File.stdout().writeStreamingAll(io, bytes) catch {};
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
