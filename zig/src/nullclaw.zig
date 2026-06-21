@@ -61,10 +61,13 @@ pub fn installNullclaw(
     dry_run: bool,
     force: bool,
 ) !InstallResult {
-    if (common.classify(io, workspace) == .missing) {
+    // Classify once: avoids 4 redundant lstat syscalls and takes a single atomic
+    // snapshot (no re-stat across the checks).
+    const ws_kind = common.classify(io, workspace);
+    if (ws_kind == .missing) {
         if (!force) return .{ .ok = false, .reason = "workspace missing" };
         if (!dry_run and !mkdirP(io, workspace)) return .{ .ok = false, .reason = "unsafe target" };
-    } else if (common.classify(io, workspace) == .symlink or common.classify(io, workspace) == .other) {
+    } else if (ws_kind == .symlink or ws_kind == .other) {
         return .{ .ok = false, .reason = "unsafe target" };
     }
 
