@@ -75,6 +75,25 @@ const DarwinStat = if (builtin.os.tag == .windows or builtin.os.tag == .linux) v
 extern "c" fn stat(noalias path: [*:0]const u8, noalias buf: *DarwinStat) c_int;
 extern "c" fn getuid() c.uid_t;
 
+// THE ONE remaining libc open(2) — for the history append path only. std.Io.File
+// has no O_APPEND open mode (OpenFileOptions.Mode is read_only/write_only/
+// read_write), so it cannot give the KERNEL-ATOMIC append the JS contract relies
+// on (caveman-config.js opens with O_APPEND so concurrent stats writers from
+// different sessions never clobber each other's JSONL line). std.c.O is `void` on
+// the linux cross target, so we use POSIX numeric O_* values per-target. Only used
+// on POSIX; the whole append path is gated !is_windows (windows is already in the
+// deferred non-FS-core bucket). O_NOFOLLOW preserves the refuse-symlink-leaf guard.
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+extern "c" fn write(fd: c_int, buf: [*]const u8, nbyte: usize) isize;
+const o_append_flags: c_int = switch (builtin.os.tag) {
+    // O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW
+    .linux => 0o1 | 0o100 | 0o2000 | 0o400000,
+    .macos, .ios, .tvos, .watchos => 0x0001 | 0x0200 | 0x0008 | 0x0100,
+    // FreeBSD/NetBSD/OpenBSD/DragonFly share these values.
+    .freebsd, .netbsd, .openbsd, .dragonfly => 0x0001 | 0x0200 | 0x0008 | 0x0100,
+    else => 0, // unused (append path is !is_windows and these are the POSIX targets)
+};
+
 pub const VALID_MODES = [_][]const u8{
     "off",
     "lite",
@@ -600,26 +619,40 @@ pub fn appendHistory(io: std.Io, path: []const u8, line: []const u8) void {
 
     cwd().createDir(io, dir, perm700()) catch {};
 
-    // Open the existing file no-follow for append; if it does not exist, create
-    // it exclusively (O_EXCL refuses a symlink leaf — same clobber guard).
-    var f = open: {
-        if (cwd().openFile(io, path, .{ .mode = .write_only, .follow_symlinks = false })) |existing| {
-            break :open existing;
-        } else |_| {
-            break :open cwd().createFile(io, path, .{ .exclusive = true, .permissions = perm600() }) catch return;
-        }
-    };
-    defer f.close(io);
+    // KERNEL-ATOMIC append — mirrors caveman-config.js appendFlag exactly:
+    // O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW open + a SINGLE write of body+'\n'.
+    // O_APPEND makes the kernel seek-to-end and write atomically per call, so two
+    // concurrent stats writers never read the same size + clobber each other (the
+    // bug a read-size-then-pwrite scheme reintroduces). O_NOFOLLOW keeps the
+    // refuse-symlink-leaf guard. POSIX-only — std.Io.File exposes no append mode;
+    // windows is in the deferred non-FS-core bucket and never reaches this path.
+    if (is_windows) return; // history append is a POSIX-only feature (matches JS getuid-gated path)
 
-    // Append offset = current size.
-    const end = f.stat(io) catch return;
-    const offset: u64 = end.size;
-
-    // Mirror JS: String(line).replace(/\n$/, '') + '\n' — strip a single
-    // trailing newline, then write the line plus exactly one newline.
+    // Mirror JS: String(line).replace(/\n$/, '') + '\n' — strip a single trailing
+    // newline, then write the line plus exactly one newline, in ONE buffer so the
+    // single O_APPEND write is atomic (no interleaving between body and newline).
     const body = if (line.len > 0 and line[line.len - 1] == '\n') line[0 .. line.len - 1] else line;
-    f.writePositionalAll(io, body, offset) catch return;
-    f.writePositionalAll(io, "\n", offset + body.len) catch return;
+    var stackbuf: [4096]u8 = undefined;
+    var heapbuf: ?[]u8 = null;
+    defer if (heapbuf) |h| std.heap.page_allocator.free(h);
+    const need = body.len + 1;
+    const buf: []u8 = if (need <= stackbuf.len)
+        stackbuf[0..need]
+    else blk: {
+        const h = std.heap.page_allocator.alloc(u8, need) catch return;
+        heapbuf = h;
+        break :blk h;
+    };
+    @memcpy(buf[0..body.len], body);
+    buf[body.len] = '\n';
+
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const pz = toZ(&pbuf, path) catch return;
+    const fd = open(pz, o_append_flags, @as(c_int, 0o600));
+    if (fd < 0) return;
+    defer _ = close(fd);
+    // Single write — O_APPEND guarantees it lands atomically at the current end.
+    _ = write(fd, buf.ptr, buf.len);
 }
 
 /// Symlink-safe history read. Returns the whole file as an owned buffer or null.
@@ -922,4 +955,108 @@ test "readFlagMode whitelist + symlink refusal" {
 
     cwd().deleteFile(io, flag) catch {};
     cwd().deleteFile(io, target) catch {};
+}
+
+test "appendHistory writes exact bytes and strips one trailing newline" {
+    if (is_windows) return error.SkipZigTest; // history append is POSIX-only
+    var th = threaded();
+    defer th.deinit();
+    const io = th.io();
+    const gpa = std.testing.allocator;
+
+    const dir_path = try makeTmpDir(io, gpa);
+    defer gpa.free(dir_path);
+    const hist = try std.fs.path.join(gpa, &.{ dir_path, ".history.jsonl" });
+    defer gpa.free(hist);
+
+    appendHistory(io, hist, "{\"a\":1}"); // no trailing \n → add one
+    appendHistory(io, hist, "{\"b\":2}\n"); // trailing \n → keep exactly one
+
+    const got = readHistoryFile(io, gpa, hist).?;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("{\"a\":1}\n{\"b\":2}\n", got);
+
+    // Symlinked history path is refused (no write, secret intact).
+    const secret = try std.fs.path.join(gpa, &.{ dir_path, "secret" });
+    defer gpa.free(secret);
+    try writeSmall(io, secret, "KEEP");
+    const link = try std.fs.path.join(gpa, &.{ dir_path, ".history-link.jsonl" });
+    defer gpa.free(link);
+    try std.testing.expect(testSymlink(io, secret, link));
+    appendHistory(io, link, "{\"c\":3}");
+    const s = try readSmall(io, gpa, secret);
+    defer gpa.free(s);
+    try std.testing.expectEqualStrings("KEEP", s);
+
+    cwd().deleteFile(io, hist) catch {};
+    cwd().deleteFile(io, link) catch {};
+    cwd().deleteFile(io, secret) catch {};
+}
+
+test "appendHistory is atomic under concurrent writers (no torn lines)" {
+    if (is_windows) return error.SkipZigTest;
+    var th = threaded();
+    defer th.deinit();
+    const io = th.io();
+    const gpa = std.testing.allocator;
+
+    const dir_path = try makeTmpDir(io, gpa);
+    defer gpa.free(dir_path);
+    const hist = try std.fs.path.join(gpa, &.{ dir_path, ".concurrent.jsonl" });
+    defer gpa.free(hist);
+
+    // Each of N forked writers appends M lines. Each line is a long, writer-tagged
+    // fixed-width record so a torn/interleaved write would be detectable as a
+    // malformed line. With O_APPEND every write lands atomically at end-of-file;
+    // a read-size-then-pwrite scheme would lose or corrupt lines under this load.
+    const writers = 8;
+    const per_writer = 200;
+    const line_body = "X" ** 300; // > a single write granularity, stresses atomicity
+
+    const fork = c.fork;
+    var pids: [writers]c_int = undefined;
+    for (0..writers) |w| {
+        const pid = fork();
+        if (pid == 0) {
+            // child: append `per_writer` lines tagged with its writer id, then _exit.
+            var i: usize = 0;
+            while (i < per_writer) : (i += 1) {
+                var buf: [400]u8 = undefined;
+                const line = std.fmt.bufPrint(&buf, "w{d:0>2}-{d:0>4}-" ++ line_body, .{ w, i }) catch line_body;
+                appendHistory(io, hist, line);
+            }
+            std.c._exit(0);
+        }
+        pids[w] = pid;
+    }
+    // parent: reap all children.
+    for (pids) |pid| {
+        var status: c_int = undefined;
+        _ = std.c.waitpid(pid, &status, 0);
+    }
+
+    // Verify: exactly writers*per_writer lines, each well-formed (prefix + 300 X's),
+    // no torn lines, every (writer,index) present exactly once.
+    const all = readHistoryFile(io, gpa, hist).?;
+    defer gpa.free(all);
+    var seen = std.AutoHashMap(u32, void).init(gpa);
+    defer seen.deinit();
+    var count: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, all, '\n');
+    while (it.next()) |ln| {
+        count += 1;
+        // shape: wNN-NNNN-XXXX...(300) → total len 3+4+1+300 = wait: "wNN-" =4, "NNNN-"=5, body=300
+        try std.testing.expect(ln.len == 4 + 5 + 300);
+        try std.testing.expect(ln[0] == 'w');
+        // body must be all 'X' (a torn write would splice another record here).
+        for (ln[9..]) |ch| try std.testing.expect(ch == 'X');
+        const w = try std.fmt.parseInt(u32, ln[1..3], 10);
+        const idx = try std.fmt.parseInt(u32, ln[4..8], 10);
+        const key = w * 100000 + idx;
+        try std.testing.expect(!seen.contains(key)); // no duplicate / overwrite
+        try seen.put(key, {});
+    }
+    try std.testing.expectEqual(@as(usize, writers * per_writer), count);
+
+    cwd().deleteFile(io, hist) catch {};
 }
