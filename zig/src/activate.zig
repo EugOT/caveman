@@ -28,19 +28,49 @@ const c = std.c;
 
 const TOOL = common.TOOL;
 
+fn toolUpper() []const u8 {
+    return if (std.mem.eql(u8, TOOL, "caveman")) "CAVEMAN" else "PONYTAIL";
+}
+
+fn appendJsonString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
+    try out.append(gpa, '"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice(gpa, "\\\""),
+            '\\' => try out.appendSlice(gpa, "\\\\"),
+            '\n' => try out.appendSlice(gpa, "\\n"),
+            '\r' => try out.appendSlice(gpa, "\\r"),
+            '\t' => try out.appendSlice(gpa, "\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try out.print(gpa, "\\u{x:0>4}", .{ch});
+                } else {
+                    try out.append(gpa, ch);
+                }
+            },
+        }
+    }
+    try out.append(gpa, '"');
+}
+
 /// The JS fallback ruleset, reproduced byte-for-byte from
 /// src/hooks/caveman-activate.js (the `else` branch when SKILL.md is absent).
 /// `{label}` is substituted for the canonical mode label in two places.
 fn emitFallbackRuleset(out: *std.ArrayList(u8), gpa: std.mem.Allocator, label: []const u8) !void {
-    try out.appendSlice(gpa, "CAVEMAN MODE ACTIVE — level: ");
+    try out.appendSlice(gpa, toolUpper());
+    try out.appendSlice(gpa, " MODE ACTIVE — level: ");
     try out.appendSlice(gpa, label);
     try out.appendSlice(gpa, "\n\n");
     try out.appendSlice(gpa, "Respond terse like smart caveman. All technical substance stay. Only fluff die.\n\n");
     try out.appendSlice(gpa, "## Persistence\n\n");
-    try out.appendSlice(gpa, "ACTIVE EVERY RESPONSE. No revert after many turns. No filler drift. Still active if unsure. Off only: \"stop caveman\" / \"normal mode\".\n\n");
+    try out.appendSlice(gpa, "ACTIVE EVERY RESPONSE. No revert after many turns. No filler drift. Still active if unsure. Off only: \"stop ");
+    try out.appendSlice(gpa, TOOL);
+    try out.appendSlice(gpa, "\" / \"normal mode\".\n\n");
     try out.appendSlice(gpa, "Current level: **");
     try out.appendSlice(gpa, label);
-    try out.appendSlice(gpa, "**. Switch: `/caveman lite|full|ultra`.\n\n");
+    try out.appendSlice(gpa, "**. Switch: `/");
+    try out.appendSlice(gpa, TOOL);
+    try out.appendSlice(gpa, " lite|full|ultra`.\n\n");
     try out.appendSlice(gpa, "## Rules\n\n");
     try out.appendSlice(gpa, "Drop: articles (a/an/the), filler (just/really/basically/actually/simply), pleasantries (sure/certainly/of course/happy to), hedging. ");
     try out.appendSlice(gpa, "Fragments OK. Short synonyms (big not extensive, fix not \"implement a solution for\"). Technical terms exact. Code blocks unchanged. Errors quoted exact.\n\n");
@@ -81,22 +111,29 @@ fn appendStatuslineNudge(out: *std.ArrayList(u8), gpa: std.mem.Allocator) void {
     // binary is the Unix path; the .ps1 counterpart handles Windows).
     const claude_dir = claudeDirPath(gpa) catch return;
     defer gpa.free(claude_dir);
-    const script_path = std.fs.path.join(gpa, &.{ claude_dir, "caveman-statusline.sh" }) catch return;
+    const script_path = std.fs.path.join(gpa, &.{ claude_dir, TOOL ++ "-statusline.sh" }) catch return;
     defer gpa.free(script_path);
     const settings_path = std.fs.path.join(gpa, &.{ claude_dir, "settings.json" }) catch return;
     defer gpa.free(settings_path);
+    const command = std.fmt.allocPrint(gpa, "bash \"{s}\"", .{script_path}) catch return;
+    defer gpa.free(command);
 
     // command = `bash "<script_path>"` then JSON.stringify(command).
-    // JSON.stringify of a path with no special chars = quote + body + quote.
     out.appendSlice(gpa, "\n\n") catch return;
-    out.appendSlice(gpa, "STATUSLINE SETUP NEEDED: The caveman plugin includes a statusline badge showing active mode ") catch return;
-    out.appendSlice(gpa, "(e.g. [CAVEMAN], [CAVEMAN:ULTRA]). It is not configured yet. ") catch return;
+    out.appendSlice(gpa, "STATUSLINE SETUP NEEDED: The ") catch return;
+    out.appendSlice(gpa, TOOL) catch return;
+    out.appendSlice(gpa, " plugin includes a statusline badge showing active mode ") catch return;
+    out.appendSlice(gpa, "(e.g. [") catch return;
+    out.appendSlice(gpa, toolUpper()) catch return;
+    out.appendSlice(gpa, "], [") catch return;
+    out.appendSlice(gpa, toolUpper()) catch return;
+    out.appendSlice(gpa, ":ULTRA]). It is not configured yet. ") catch return;
     out.appendSlice(gpa, "To enable, add this to ") catch return;
     out.appendSlice(gpa, settings_path) catch return;
     out.appendSlice(gpa, ": ") catch return;
-    out.appendSlice(gpa, "\"statusLine\": { \"type\": \"command\", \"command\": \"bash \\\"") catch return;
-    out.appendSlice(gpa, script_path) catch return;
-    out.appendSlice(gpa, "\\\"\" } ") catch return;
+    out.appendSlice(gpa, "\"statusLine\": { \"type\": \"command\", \"command\": ") catch return;
+    appendJsonString(out, gpa, command) catch return;
+    out.appendSlice(gpa, " } ") catch return;
     out.appendSlice(gpa, "Proactively offer to set this up for the user on first interaction.") catch return;
 }
 
@@ -136,9 +173,12 @@ pub fn main() !void {
 
     // 2. Independent modes — short activation line, skill defines behavior.
     if (common.isIndependentMode(mode)) {
-        try out.appendSlice(gpa, "CAVEMAN MODE ACTIVE — level: ");
+        try out.appendSlice(gpa, toolUpper());
+        try out.appendSlice(gpa, " MODE ACTIVE — level: ");
         try out.appendSlice(gpa, mode);
-        try out.appendSlice(gpa, ". Behavior defined by /caveman-");
+        try out.appendSlice(gpa, ". Behavior defined by /");
+        try out.appendSlice(gpa, TOOL);
+        try out.append(gpa, '-');
         try out.appendSlice(gpa, mode);
         try out.appendSlice(gpa, " skill.");
         common.writeStdout(out.items);
@@ -170,7 +210,9 @@ test "emitFallbackRuleset embeds level label twice" {
     try emitFallbackRuleset(&out, gpa, "ultra");
 
     // Header line.
-    try std.testing.expect(std.mem.startsWith(u8, out.items, "CAVEMAN MODE ACTIVE — level: ultra\n\n"));
+    const header = try std.fmt.allocPrint(gpa, "{s} MODE ACTIVE — level: ultra\n\n", .{toolUpper()});
+    defer gpa.free(header);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, header));
     // "Current level: **ultra**." appears in the Persistence section.
     try std.testing.expect(std.mem.indexOf(u8, out.items, "Current level: **ultra**.") != null);
     // Structural anchors preserved.
@@ -180,13 +222,23 @@ test "emitFallbackRuleset embeds level label twice" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "## Boundaries") != null);
 }
 
+test "appendJsonString escapes statusline command" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try appendJsonString(&out, gpa, "bash \"/tmp/a \\\"quoted\\\" path/statusline.sh\"");
+    try std.testing.expectEqualStrings("\"bash \\\"/tmp/a \\\\\\\"quoted\\\\\\\" path/statusline.sh\\\"\"", out.items);
+}
+
 test "wenyan alias resolves to wenyan-full label" {
     const gpa = std.testing.allocator;
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     const label = if (std.mem.eql(u8, "wenyan", "wenyan")) "wenyan-full" else "wenyan";
     try emitFallbackRuleset(&out, gpa, label);
-    try std.testing.expect(std.mem.startsWith(u8, out.items, "CAVEMAN MODE ACTIVE — level: wenyan-full\n\n"));
+    const header = try std.fmt.allocPrint(gpa, "{s} MODE ACTIVE — level: wenyan-full\n\n", .{toolUpper()});
+    defer gpa.free(header);
+    try std.testing.expect(std.mem.startsWith(u8, out.items, header));
 }
 
 test "independent mode emits short activation line" {
@@ -194,13 +246,18 @@ test "independent mode emits short activation line" {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     const mode = "commit";
-    try out.appendSlice(gpa, "CAVEMAN MODE ACTIVE — level: ");
+    try out.appendSlice(gpa, toolUpper());
+    try out.appendSlice(gpa, " MODE ACTIVE — level: ");
     try out.appendSlice(gpa, mode);
-    try out.appendSlice(gpa, ". Behavior defined by /caveman-");
+    try out.appendSlice(gpa, ". Behavior defined by /");
+    try out.appendSlice(gpa, TOOL);
+    try out.append(gpa, '-');
     try out.appendSlice(gpa, mode);
     try out.appendSlice(gpa, " skill.");
+    const want = try std.fmt.allocPrint(gpa, "{s} MODE ACTIVE — level: commit. Behavior defined by /{s}-commit skill.", .{ toolUpper(), TOOL });
+    defer gpa.free(want);
     try std.testing.expectEqualStrings(
-        "CAVEMAN MODE ACTIVE — level: commit. Behavior defined by /caveman-commit skill.",
+        want,
         out.items,
     );
 }

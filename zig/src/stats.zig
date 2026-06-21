@@ -129,7 +129,7 @@ pub fn humanizeTokens(gpa: std.mem.Allocator, n: f64) ![]u8 {
 /// integers). Negative values keep the sign; grouping applies to the magnitude.
 pub fn grouped(gpa: std.mem.Allocator, value: i64) ![]u8 {
     var tmp: [24]u8 = undefined;
-    const mag: u64 = @intCast(if (value < 0) -value else value);
+    const mag: u64 = absMagnitude(value);
     const digits = std.fmt.bufPrint(&tmp, "{d}", .{mag}) catch unreachable;
 
     var out: std.ArrayList(u8) = .empty;
@@ -141,6 +141,12 @@ pub fn grouped(gpa: std.mem.Allocator, value: i64) ![]u8 {
         try out.append(gpa, ch);
     }
     return out.toOwnedSlice(gpa);
+}
+
+fn absMagnitude(value: i64) u64 {
+    if (value >= 0) return @intCast(value);
+    const plus_one = value + 1;
+    return @as(u64, @intCast(-plus_one)) + 1;
 }
 
 /// One parsed session snapshot — the four fields the JS parseSession returns.
@@ -159,9 +165,23 @@ pub const Session = struct {
 fn asInt(v: std.json.Value) i64 {
     return switch (v) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| floatToI64(f),
         else => 0,
     };
+}
+
+fn floatToI64(f: f64) i64 {
+    if (!std.math.isFinite(f)) return 0;
+    const rounded = @round(f);
+    const max_f: f64 = @floatFromInt(std.math.maxInt(i64));
+    const min_f: f64 = @floatFromInt(std.math.minInt(i64));
+    if (rounded >= max_f) return std.math.maxInt(i64);
+    if (rounded <= min_f) return std.math.minInt(i64);
+    return @intFromFloat(rounded);
+}
+
+fn addClamped(acc: *i64, delta: i64) void {
+    acc.* = std.math.add(i64, acc.*, delta) catch if (delta >= 0) std.math.maxInt(i64) else std.math.minInt(i64);
 }
 
 /// Parse the session JSONL line-by-line, tolerating malformed lines (exactly
@@ -196,9 +216,9 @@ pub fn parseSession(gpa: std.mem.Allocator, raw: []const u8) Session {
             .object => |o| o,
             else => continue,
         };
-        if (uobj.get("output_tokens")) |v| s.output_tokens += asInt(v);
-        if (uobj.get("cache_read_input_tokens")) |v| s.cache_read_tokens += asInt(v);
-        s.turns += 1;
+        if (uobj.get("output_tokens")) |v| addClamped(&s.output_tokens, asInt(v));
+        if (uobj.get("cache_read_input_tokens")) |v| addClamped(&s.cache_read_tokens, asInt(v));
+        addClamped(&s.turns, 1);
         if (s.model == null) {
             if (mobj.get("model")) |mv| switch (mv) {
                 .string => |ms| s.model = gpa.dupe(u8, ms) catch null,
@@ -350,7 +370,7 @@ pub fn aggregateSavedTokens(gpa: std.mem.Allocator, history_raw: []const u8) i64
 
     var total: i64 = 0;
     var vit = latest.valueIterator();
-    while (vit.next()) |v| total += v.saved;
+    while (vit.next()) |v| addClamped(&total, v.saved);
     return total;
 }
 
@@ -566,6 +586,7 @@ test "grouped thousands separators" {
         .{ .in = 1021, .want = "1,021" },
         .{ .in = 1234567, .want = "1,234,567" },
         .{ .in = -4000, .want = "-4,000" },
+        .{ .in = std.math.minInt(i64), .want = "-9,223,372,036,854,775,808" },
     };
     for (cases) |ca| {
         const got = try grouped(gpa, ca.in);
@@ -592,6 +613,19 @@ test "parseSession sums tokens over fixture JSONL, captures first model" {
     try std.testing.expectEqual(@as(i64, 4000), s.cache_read_tokens); // 2000+1500+0+500
     try std.testing.expectEqual(@as(i64, 4), s.turns);
     try std.testing.expectEqualStrings("claude-opus-4-20250514", s.model.?); // first wins
+}
+
+test "parseSession clamps overflowing token counters" {
+    const gpa = std.testing.allocator;
+    const max = "9223372036854775807";
+    const fixture =
+        "{\"type\":\"assistant\",\"message\":{\"usage\":{\"output_tokens\":" ++ max ++ ",\"cache_read_input_tokens\":" ++ max ++ "}}}\n" ++
+        "{\"type\":\"assistant\",\"message\":{\"usage\":{\"output_tokens\":1,\"cache_read_input_tokens\":1}}}\n";
+    var s = parseSession(gpa, fixture);
+    defer s.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), s.output_tokens);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), s.cache_read_tokens);
+    try std.testing.expectEqual(@as(i64, 2), s.turns);
 }
 
 test "deriveSavings math (full mode, opus legacy price)" {
@@ -685,6 +719,14 @@ test "aggregateSavedTokens keeps latest per session_id" {
     // a → latest is ts=200 (50); b → 7. Total 57.
     try std.testing.expectEqual(@as(i64, 57), aggregateSavedTokens(gpa, hist));
     try std.testing.expectEqual(@as(i64, 0), aggregateSavedTokens(gpa, ""));
+}
+
+test "aggregateSavedTokens clamps overflowing totals" {
+    const gpa = std.testing.allocator;
+    const hist =
+        "{\"ts\":1,\"session_id\":\"a\",\"est_saved_tokens\":9223372036854775807}\n" ++
+        "{\"ts\":1,\"session_id\":\"b\",\"est_saved_tokens\":1}\n";
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), aggregateSavedTokens(gpa, hist));
 }
 
 test "refreshSuffix writes ⛏ + humanized lifetime savings" {

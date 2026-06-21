@@ -61,7 +61,7 @@ pub fn installNullclaw(
 ) !InstallResult {
     if (common.classify(workspace) == .missing) {
         if (!force) return .{ .ok = false, .reason = "workspace missing" };
-        if (!dry_run) mkdirP(workspace);
+        if (!dry_run and !mkdirP(workspace)) return .{ .ok = false, .reason = "unsafe target" };
     } else if (common.classify(workspace) == .symlink or common.classify(workspace) == .other) {
         return .{ .ok = false, .reason = "unsafe target" };
     }
@@ -87,7 +87,7 @@ pub fn installNullclaw(
 
     // skills/caveman/ is two levels under the workspace; common.safeWriteFlag
     // only mkdirs the immediate parent, so create the tree first.
-    mkdirP(skill_dir);
+    if (!mkdirP(skill_dir)) return .{ .ok = false, .reason = "unsafe target" };
 
     const merged = try openclaw.mergeOpenclawFrontmatter(gpa, skill_body);
     defer gpa.free(merged);
@@ -99,15 +99,16 @@ pub fn installNullclaw(
 pub fn uninstallNullclaw(gpa: std.mem.Allocator, workspace: []const u8, dry_run: bool) !void {
     const skill_dir = try std.fs.path.join(gpa, &.{ workspace, "skills", SKILL_NAME });
     defer gpa.free(skill_dir);
-    if (common.classify(skill_dir) != .missing and !dry_run) {
+    if (common.classify(skill_dir) == .dir and !dry_run) {
         openclaw.removeTree(gpa, skill_dir);
     }
 }
 
 // ── Filesystem helpers (libc) ───────────────────────────────────────────────
-fn mkdirP(dir: []const u8) void {
+fn mkdirP(dir: []const u8) bool {
+    if (common.ancestorUnsafe(dir)) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (dir.len >= buf.len) return;
+    if (dir.len >= buf.len) return false;
     var i: usize = 0;
     while (i < dir.len) {
         var j = i;
@@ -120,6 +121,7 @@ fn mkdirP(dir: []const u8) void {
         }
         i = j + 1;
     }
+    return common.classify(dir) == .dir;
 }
 
 // removeTree is shared via openclaw.removeTree (libc opendir/readdir + lstat).
@@ -267,6 +269,42 @@ test "installNullclaw refuses symlinked skill target" {
 
     _ = c.unlink(try common.toZ(&sb, skill_file));
     _ = c.unlink(try common.toZ(&ob, outside));
+}
+
+test "uninstallNullclaw skips symlinked skill directory" {
+    const gpa = testing.allocator;
+    const dir_path = try common.makeTmpDir(gpa);
+    defer gpa.free(dir_path);
+    const ws = try std.fs.path.join(gpa, &.{ dir_path, "null-ws3" });
+    defer gpa.free(ws);
+    const skills = try std.fs.path.join(gpa, &.{ ws, "skills" });
+    defer gpa.free(skills);
+    try common.mkdirPath(ws);
+    try common.mkdirPath(skills);
+
+    const outside = try std.fs.path.join(gpa, &.{ dir_path, "outside-skill" });
+    defer gpa.free(outside);
+    try common.mkdirPath(outside);
+    const marker = try std.fs.path.join(gpa, &.{ outside, "marker.txt" });
+    defer gpa.free(marker);
+    try common.writeSmall(marker, "keep\n");
+
+    const skill_dir = try std.fs.path.join(gpa, &.{ skills, "caveman" });
+    defer gpa.free(skill_dir);
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    var sb: [std.fs.max_path_bytes]u8 = undefined;
+    try testing.expect(c.symlink(try common.toZ(&ob, outside), try common.toZ(&sb, skill_dir)) == 0);
+
+    try uninstallNullclaw(gpa, ws, false);
+    try testing.expect(common.classify(skill_dir) == .symlink);
+    const data = try common.readSmall(gpa, marker);
+    defer gpa.free(data);
+    try testing.expectEqualStrings("keep\n", data);
+
+    _ = c.unlink(try common.toZ(&sb, skill_dir));
+    var mb: [std.fs.max_path_bytes]u8 = undefined;
+    _ = c.unlink(try common.toZ(&mb, marker));
+    _ = c.rmdir(try common.toZ(&ob, outside));
 }
 
 fn countOccurrences(hay: []const u8, needle: []const u8) usize {

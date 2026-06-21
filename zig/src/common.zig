@@ -148,6 +148,13 @@ pub fn isRegularFileNoSymlink(path: []const u8) bool {
     return (st.mode & c.S.IFMT) == c.S.IFREG;
 }
 
+pub fn existsNoFollow(path: []const u8) bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = toZ(&buf, path) catch return false;
+    var st: c.Stat = undefined;
+    return lstat(z, &st) == 0;
+}
+
 fn readModeFromConfigFile(gpa: std.mem.Allocator, path: []const u8) ?[]const u8 {
     if (!isRegularFileNoSymlink(path)) return null;
     const raw = readFileAlloc(gpa, path, 16 * 1024) orelse return null;
