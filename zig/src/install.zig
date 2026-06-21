@@ -1526,9 +1526,9 @@ fn installHooks(ctx: *Ctx) []const u8 {
         const sl_cmd = fmt(ctx, "bash \"{s}\"", .{statusline});
         if (doc.value == .object and doc.value.object.get("statusLine") == null) {
             var slo: std.json.ObjectMap = .{};
-            slo.put(doc.arena, "type", .{ .string = "command" }) catch {};
-            slo.put(doc.arena, "command", .{ .string = sl_cmd }) catch {};
-            doc.value.object.put(doc.arena, "statusLine", .{ .object = slo }) catch {};
+            slo.put(arena, "type", .{ .string = "command" }) catch {};
+            slo.put(arena, "command", .{ .string = sl_cmd }) catch {};
+            doc.value.object.put(arena, "statusLine", .{ .object = slo }) catch {};
             out("  statusline badge configured.\n");
         } else if (doc.value == .object) {
             const sl_val = doc.value.object.get("statusLine").?;

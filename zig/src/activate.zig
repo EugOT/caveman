@@ -27,9 +27,14 @@ const common = @import("common.zig");
 const c = std.c;
 
 const TOOL = common.TOOL;
+const TOOL_UPPER = blk: {
+    if (std.mem.eql(u8, TOOL, "caveman")) break :blk "CAVEMAN";
+    if (std.mem.eql(u8, TOOL, "ponytail")) break :blk "PONYTAIL";
+    @compileError("unknown TOOL value: " ++ TOOL);
+};
 
 fn toolUpper() []const u8 {
-    return if (std.mem.eql(u8, TOOL, "caveman")) "CAVEMAN" else "PONYTAIL";
+    return TOOL_UPPER;
 }
 
 fn appendJsonString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {

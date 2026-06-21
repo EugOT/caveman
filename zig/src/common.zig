@@ -272,8 +272,34 @@ fn trimTrailingSlash(s: []const u8) []const u8 {
     return s[0..end];
 }
 
+const Anchor = struct {
+    prefix: []const u8,
+    resolved: []const u8,
+};
+
+fn existingAnchorForBase(base: []const u8, out: *[std.fs.max_path_bytes]u8) ?Anchor {
+    var prefix = base;
+    while (prefix.len > 0) {
+        if (realpathZ(prefix, out)) |resolved| {
+            return .{ .prefix = prefix, .resolved = resolved };
+        }
+        const parent = std.fs.path.dirname(prefix) orelse return null;
+        if (parent.len == prefix.len) return null;
+        prefix = parent;
+    }
+    return null;
+}
+
 pub fn ancestorUnsafe(dir: []const u8) bool {
-    const bases: [3]?[]const u8 = .{ getenv("HOME"), getenv("TMPDIR"), getenv("CLAUDE_CONFIG_DIR") };
+    const bases: [7]?[]const u8 = .{
+        getenv("HOME"),
+        getenv("TMPDIR"),
+        getenv("CLAUDE_CONFIG_DIR"),
+        getenv("XDG_CONFIG_HOME"),
+        getenv("OPENCODE_CONFIG_DIR"),
+        getenv("OPENCLAW_WORKSPACE"),
+        getenv("NULLCLAW_WORKSPACE"),
+    };
 
     var best_base: ?[]const u8 = null;
     for (bases) |maybe| {
@@ -294,9 +320,10 @@ pub fn ancestorUnsafe(dir: []const u8) bool {
     const base = best_base orelse return true; // outside every trusted base → refuse
 
     var anchor_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const anchor = realpathZ(base, &anchor_buf) orelse return true;
+    const anchor_info = existingAnchorForBase(base, &anchor_buf) orelse return true;
+    const anchor = anchor_info.resolved;
 
-    const tail = dir[base.len..]; // leading '/' or empty
+    const tail = dir[anchor_info.prefix.len..]; // leading '/' or empty
     var cur_buf: [std.fs.max_path_bytes]u8 = undefined;
     if (anchor.len >= cur_buf.len) return true;
     @memcpy(cur_buf[0..anchor.len], anchor);
@@ -678,6 +705,42 @@ test "safeWriteFlag writes mode on clean path" {
 
     var fb: [std.fs.max_path_bytes]u8 = undefined;
     _ = c.unlink(try toZ(&fb, flag));
+}
+
+test "safeWriteFlag honors configured opencode root outside HOME" {
+    const gpa = std.testing.allocator;
+    const old_tmp = try saveEnv(gpa, "TMPDIR");
+    defer if (old_tmp) |v| gpa.free(v);
+    defer restoreEnv("TMPDIR", old_tmp);
+    const old_opencode = try saveEnv(gpa, "OPENCODE_CONFIG_DIR");
+    defer if (old_opencode) |v| gpa.free(v);
+    defer restoreEnv("OPENCODE_CONFIG_DIR", old_opencode);
+
+    _ = unsetenv("TMPDIR");
+
+    const dir_path = try makeTmpDir(gpa);
+    defer gpa.free(dir_path);
+    const root = try std.fs.path.join(gpa, &.{ dir_path, "external-opencode" });
+    defer gpa.free(root);
+    try mkdirPath(root);
+
+    const root_z = try gpa.dupeZ(u8, root);
+    defer gpa.free(root_z);
+    _ = setenv("OPENCODE_CONFIG_DIR", root_z.ptr, 1);
+
+    const nested = try std.fs.path.join(gpa, &.{ root, "plugins", "caveman" });
+    defer gpa.free(nested);
+    try std.testing.expect(!ancestorUnsafe(nested));
+
+    const settings = try std.fs.path.join(gpa, &.{ root, "opencode.json" });
+    defer gpa.free(settings);
+    try safeWriteFlag(gpa, settings, "{}\n");
+    const data = try readSmall(gpa, settings);
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("{}\n", data);
+
+    var sbuf: [std.fs.max_path_bytes]u8 = undefined;
+    _ = c.unlink(try toZ(&sbuf, settings));
 }
 
 test "safeWriteFlag refuses symlinked GRANDPARENT (ancestor) dir" {
