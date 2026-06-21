@@ -88,15 +88,15 @@ fn anyPairOrdered(prompt: []const u8, firsts: []const []const u8, seconds: []con
 fn parseDeactivation(prompt: []const u8) bool {
     const verbs = &.{ "stop", "disable", "deactivate", "turn off" };
     return containsAny(prompt, &.{"normal mode"}) or
-        anyOrdered(prompt, verbs, "caveman") or
-        anyPairOrdered(prompt, &.{"caveman"}, verbs);
+        anyOrdered(prompt, verbs, TOOL) or
+        anyPairOrdered(prompt, &.{TOOL}, verbs);
 }
 
 fn parseNaturalActivation(prompt: []const u8, default_mode: []const u8) ?ModeChange {
-    const before_caveman = &.{ "activate", "enable", "turn on", "start", "talk like" };
-    const after_caveman = &.{ "mode", "activate", "enable", "turn on", "start" };
-    if (anyOrdered(prompt, before_caveman, "caveman") or
-        anyPairOrdered(prompt, &.{"caveman"}, after_caveman) or
+    const before_tool = &.{ "activate", "enable", "turn on", "start", "talk like" };
+    const after_tool = &.{ "mode", "activate", "enable", "turn on", "start" };
+    if (anyOrdered(prompt, before_tool, TOOL) or
+        anyPairOrdered(prompt, &.{TOOL}, after_tool) or
         containsAny(prompt, &.{ "less tokens", "fewer tokens", "be brief", "be terse", "shorter answers" }))
     {
         if (std.mem.eql(u8, default_mode, "off")) return null;
@@ -140,8 +140,8 @@ fn parseSlashMode(prompt: []const u8, default_mode: []const u8) ?ModeChange {
 }
 
 fn parseModeChange(prompt: []const u8, default_mode: []const u8) ?ModeChange {
-    if (parseDeactivation(prompt)) return .deactivate;
     if (parseSlashMode(prompt, default_mode)) |change| return change;
+    if (parseDeactivation(prompt)) return .deactivate;
     return parseNaturalActivation(prompt, default_mode);
 }
 
@@ -241,12 +241,21 @@ test "parseModeChange is case-insensitive" {
 }
 
 test "parseModeChange natural language toggles" {
-    try expectActivate("lite", "please talk like caveman now", "lite");
+    const activate_phrase = if (std.mem.eql(u8, TOOL, "caveman")) "please talk like caveman now" else "please talk like ponytail now";
+    const stop_phrase = if (std.mem.eql(u8, TOOL, "caveman")) "turn off caveman" else "turn off ponytail";
+    const stop_talking_phrase = if (std.mem.eql(u8, TOOL, "caveman")) "stop talking like caveman" else "stop talking like ponytail";
+    const off_phrase = if (std.mem.eql(u8, TOOL, "caveman")) "activate caveman" else "activate ponytail";
+    try expectActivate("lite", activate_phrase, "lite");
     try expectActivate("ultra", "LESS TOKENS please", "ultra");
     try expectDeactivate("normal mode", "full");
-    try expectDeactivate("turn off caveman", "full");
-    try expectDeactivate("stop talking like caveman", "full");
-    try std.testing.expect(parseModeChange("activate caveman", "off") == null);
+    try expectDeactivate(stop_phrase, "full");
+    try expectDeactivate(stop_talking_phrase, "full");
+    try std.testing.expect(parseModeChange(off_phrase, "off") == null);
+}
+
+test "parseModeChange parses slash commands before natural deactivation" {
+    const prompt = "/" ++ TOOL ++ " ultra then stop " ++ TOOL;
+    try expectActivate("ultra", prompt, "full");
 }
 
 test "extractPrompt pulls prompt field" {

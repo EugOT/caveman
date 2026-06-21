@@ -28,6 +28,33 @@ const c = std.c;
 
 const TOOL = common.TOOL;
 
+/// JSON-encode a string into `out` (RFC 8259 escaping), matching JS
+/// JSON.stringify of a plain string. Escapes `"`, `\`, the C0 control
+/// characters, and emits `\uXXXX` for any remaining byte < 0x20. Used to embed
+/// the statusline `command` value in the setup nudge so a script path with a
+/// quote, backslash, or control byte can never produce malformed JSON that the
+/// model would then copy verbatim into settings.json.
+fn appendJsonString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
+    try out.append(gpa, '"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice(gpa, "\\\""),
+            '\\' => try out.appendSlice(gpa, "\\\\"),
+            '\n' => try out.appendSlice(gpa, "\\n"),
+            '\r' => try out.appendSlice(gpa, "\\r"),
+            '\t' => try out.appendSlice(gpa, "\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try out.print(gpa, "\\u{x:0>4}", .{ch});
+                } else {
+                    try out.append(gpa, ch);
+                }
+            },
+        }
+    }
+    try out.append(gpa, '"');
+}
+
 /// The JS fallback ruleset, reproduced byte-for-byte from
 /// src/hooks/caveman-activate.js (the `else` branch when SKILL.md is absent).
 /// `{label}` is substituted for the canonical mode label in two places.
@@ -85,18 +112,22 @@ fn appendStatuslineNudge(out: *std.ArrayList(u8), gpa: std.mem.Allocator) void {
     defer gpa.free(script_path);
     const settings_path = std.fs.path.join(gpa, &.{ claude_dir, "settings.json" }) catch return;
     defer gpa.free(settings_path);
+    const command = std.fmt.allocPrint(gpa, "bash \"{s}\"", .{script_path}) catch return;
+    defer gpa.free(command);
 
-    // command = `bash "<script_path>"` then JSON.stringify(command).
-    // JSON.stringify of a path with no special chars = quote + body + quote.
+    // command = `bash "<script_path>"` then JSON.stringify(command). Escape the
+    // command value through appendJsonString so a script path containing a
+    // quote, backslash, or control byte can never emit malformed JSON in the
+    // nudge the model surfaces (and may copy verbatim into settings.json).
     out.appendSlice(gpa, "\n\n") catch return;
     out.appendSlice(gpa, "STATUSLINE SETUP NEEDED: The caveman plugin includes a statusline badge showing active mode ") catch return;
     out.appendSlice(gpa, "(e.g. [CAVEMAN], [CAVEMAN:ULTRA]). It is not configured yet. ") catch return;
     out.appendSlice(gpa, "To enable, add this to ") catch return;
     out.appendSlice(gpa, settings_path) catch return;
     out.appendSlice(gpa, ": ") catch return;
-    out.appendSlice(gpa, "\"statusLine\": { \"type\": \"command\", \"command\": \"bash \\\"") catch return;
-    out.appendSlice(gpa, script_path) catch return;
-    out.appendSlice(gpa, "\\\"\" } ") catch return;
+    out.appendSlice(gpa, "\"statusLine\": { \"type\": \"command\", \"command\": ") catch return;
+    appendJsonString(out, gpa, command) catch return;
+    out.appendSlice(gpa, " } ") catch return;
     out.appendSlice(gpa, "Proactively offer to set this up for the user on first interaction.") catch return;
 }
 
@@ -178,6 +209,14 @@ test "emitFallbackRuleset embeds level label twice" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "## Rules") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "## Auto-Clarity") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "## Boundaries") != null);
+}
+
+test "appendJsonString escapes statusline command" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try appendJsonString(&out, gpa, "bash \"/tmp/a \\\"quoted\\\" path/statusline.sh\"");
+    try std.testing.expectEqualStrings("\"bash \\\"/tmp/a \\\\\\\"quoted\\\\\\\" path/statusline.sh\\\"\"", out.items);
 }
 
 test "wenyan alias resolves to wenyan-full label" {
