@@ -66,7 +66,13 @@ fn spawn(gpa: std.mem.Allocator, argv: []const [:0]const u8) SpawnError!Child {
     }
 
     // Build a NULL-terminated argv for execvp.
-    const cargv = try gpa.allocSentinel(?[*:0]const u8, argv.len, null);
+    const cargv = gpa.allocSentinel(?[*:0]const u8, argv.len, null) catch {
+        _ = close(in_fds[0]);
+        _ = close(in_fds[1]);
+        _ = close(out_fds[0]);
+        _ = close(out_fds[1]);
+        return error.OutOfMemory;
+    };
     defer gpa.free(cargv);
     for (argv, 0..) |a, i| cargv[i] = a.ptr;
 
@@ -130,6 +136,20 @@ const LineBuffer = struct {
             std.mem.copyForwards(u8, self.buf.items[0..remaining], self.buf.items[nl + 1 ..]);
             self.buf.shrinkRetainingCapacity(remaining);
         }
+    }
+
+    fn flush(
+        self: *LineBuffer,
+        gpa: std.mem.Allocator,
+        comptime Ctx: type,
+        ctx: Ctx,
+        comptime onLine: fn (Ctx, []const u8) void,
+    ) void {
+        if (std.mem.trim(u8, self.buf.items, " \t\r\n").len != 0) {
+            onLine(ctx, self.buf.items);
+        }
+        self.buf.clearRetainingCapacity();
+        _ = gpa;
     }
 };
 
@@ -207,8 +227,9 @@ fn transformLine(
 
     if (!compressed_something) {
         // Deep-walk the result subtree, compressing nested `field` strings.
-        compressInPlace(arena, result_val, fields);
+        compressed_something = compressInPlace(arena, result_val, fields);
     }
+    if (!compressed_something) return null;
 
     // Re-serialize the (possibly mutated) root into a gpa-owned buffer.
     return std.json.Stringify.valueAlloc(gpa, parsed.value, .{}) catch null;
@@ -225,10 +246,13 @@ fn nameOf(obj: std.json.ObjectMap) []const u8 {
 /// Walk a Value tree (by mutable pointer), compressing every `field`-named
 /// string in place. Mirrors compressDescriptionsInPlace in compress.js.
 /// Compressed strings are allocated from `arena` (caller owns the arena).
-fn compressInPlace(arena: std.mem.Allocator, value: std.json.Value, fields: []const []const u8) void {
+fn compressInPlace(arena: std.mem.Allocator, value: std.json.Value, fields: []const []const u8) bool {
+    var changed = false;
     switch (value) {
         .array => |a| {
-            for (a.items) |*child| compressInPlace(arena, child.*, fields);
+            for (a.items) |*child| {
+                if (compressInPlace(arena, child.*, fields)) changed = true;
+            }
         },
         .object => |o| {
             var it = o.iterator();
@@ -246,14 +270,16 @@ fn compressInPlace(arena: std.mem.Allocator, value: std.json.Value, fields: []co
                     const out = compress(arena, vp.*.string) catch continue;
                     if (!std.mem.eql(u8, out, vp.*.string)) {
                         vp.* = .{ .string = out };
+                        changed = true;
                     }
                 } else {
-                    compressInPlace(arena, vp.*, fields);
+                    if (compressInPlace(arena, vp.*, fields)) changed = true;
                 }
             }
         },
         else => {},
     }
+    return changed;
 }
 
 // ── Proxy loop ───────────────────────────────────────────────────────────────
@@ -332,6 +358,7 @@ fn pump(ctx: *ProxyCtx, child: Child) void {
                 const r = c.read(0, &read_buf, read_buf.len);
                 if (r <= 0) {
                     stdin_open = false;
+                    cl_buf.flush(gpa, *ProxyCtx, ctx, onClientLine);
                     // EOF from client → close upstream stdin so it can exit.
                     _ = close(child.stdin_w);
                 } else {
@@ -346,7 +373,12 @@ fn pump(ctx: *ProxyCtx, child: Child) void {
                 const r = c.read(child.stdout_r, &read_buf, read_buf.len);
                 if (r <= 0) {
                     stdout_open = false;
+                    up_buf.flush(gpa, *ProxyCtx, ctx, onUpstreamLine);
                     _ = close(child.stdout_r);
+                    if (stdin_open) {
+                        stdin_open = false;
+                        _ = close(child.stdin_w);
+                    }
                 } else {
                     up_buf.push(gpa, read_buf[0..@intCast(r)], *ProxyCtx, ctx, onUpstreamLine) catch {};
                 }
@@ -475,9 +507,7 @@ test "transformLine passes through non-list result (no tools/prompts array)" {
     ;
     // result has no tools/prompts/resources; only the deep-walk applies, and it
     // only touches `description` keys — `text` isn't one, so nothing changes.
-    const out = transformLine(gpa, line, &.{"description"}, false).?;
-    defer gpa.free(out);
-    try testing.expect(std.mem.indexOf(u8, out, "the result is here") != null);
+    try testing.expect(transformLine(gpa, line, &.{"description"}, false) == null);
 }
 
 test "transformLine returns null for non-JSON line (passthrough)" {
@@ -508,4 +538,12 @@ test "transformLine respects extra field names" {
     defer gpa.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "Please") == null);
     try testing.expect(std.mem.indexOf(u8, out, "Run build") != null);
+}
+
+test "transformLine returns null when JSON needs no mutation" {
+    const gpa = testing.allocator;
+    const line =
+        \\{"jsonrpc":"2.0","id":3,"result":{"tools":[{"name":"reader","description":"src/index.js"}]}}
+    ;
+    try testing.expect(transformLine(gpa, line, &.{"description"}, false) == null);
 }

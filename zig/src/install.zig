@@ -668,11 +668,14 @@ const SettingsDoc = struct {
 /// Read+parse a settings file. Returns null only when the file exists but is
 /// unparseable (mirrors readSettings returning null). Missing file ⇒ empty {}.
 fn readSettingsDoc(gpa: std.mem.Allocator, path: []const u8) ?SettingsDoc {
-    const raw = common.readFileAlloc(gpa, path, 16 * 1024 * 1024) orelse "";
+    const raw = if (common.existsNoFollow(path)) blk: {
+        if (!common.isRegularFileNoSymlink(path)) return null;
+        break :blk common.readFileAlloc(gpa, path, 16 * 1024 * 1024) orelse return null;
+    } else "";
     const value = settings.parseSettings(gpa, raw) catch {
         // Existing-but-unparseable ⇒ JS null. Missing file already yields "".
         if (raw.len == 0) {
-            return .{ .arena = gpa, .value = .{ .object = .{} } };
+            return .{ .arena = gpa, .value = .{ .object = std.json.ObjectMap.init(gpa) } };
         }
         return null;
     };
@@ -708,9 +711,10 @@ fn detectRepoRoot(gpa: std.mem.Allocator) ?[]const u8 {
 }
 
 // ── Filesystem helpers ────────────────────────────────────────────────────────
-fn mkdirP(dir: []const u8) void {
+fn mkdirP(dir: []const u8) bool {
+    if (common.ancestorUnsafe(dir)) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (dir.len >= buf.len) return;
+    if (dir.len >= buf.len) return false;
     var i: usize = 0;
     while (i < dir.len) {
         var j = i;
@@ -723,6 +727,7 @@ fn mkdirP(dir: []const u8) void {
         }
         i = j + 1;
     }
+    return common.classify(dir) == .dir;
 }
 
 fn copyFile(gpa: std.mem.Allocator, src: []const u8, dest: []const u8) bool {
@@ -733,23 +738,39 @@ fn copyFile(gpa: std.mem.Allocator, src: []const u8, dest: []const u8) bool {
 }
 
 fn writeFile0644(path: []const u8, content: []const u8) !void {
+    if (common.isSymlink(path)) return error.SymlinkRefused;
+    const dir = std.fs.path.dirname(path) orelse ".";
+    if (common.ancestorUnsafe(dir)) return error.ParentSymlinkRefused;
+    if (!mkdirP(dir)) return error.ParentSymlinkRefused;
+
+    const tmp = try std.fmt.allocPrint(std.heap.c_allocator, "{s}.tmp.{d}", .{ path, c.getpid() });
+    defer std.heap.c_allocator.free(tmp);
+
+    var tbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const tz = try common.toZ(&tbuf, tmp);
+    const flags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true };
+    const fd = c.open(tz, flags, @as(c.mode_t, 0o644));
+    if (fd < 0) return error.OpenFailed;
+    {
+        defer _ = close(fd);
+        var written: usize = 0;
+        while (written < content.len) {
+            const n = c.write(fd, content.ptr + written, content.len - written);
+            if (n <= 0) return error.WriteFailed;
+            written += @intCast(n);
+        }
+    }
+
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const pz = try common.toZ(&pbuf, path);
-    _ = c.unlink(pz);
-    const flags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
-    const fd = c.open(pz, flags, @as(c.mode_t, 0o644));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = close(fd);
-    var written: usize = 0;
-    while (written < content.len) {
-        const n = c.write(fd, content.ptr + written, content.len - written);
-        if (n <= 0) return error.WriteFailed;
-        written += @intCast(n);
+    if (c.rename(tz, pz) != 0) {
+        _ = c.unlink(tz);
+        return error.RenameFailed;
     }
 }
 
 fn copyDirRecursive(gpa: std.mem.Allocator, src: []const u8, dest: []const u8) void {
-    mkdirP(dest);
+    if (!mkdirP(dest)) return;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = common.toZ(&buf, src) catch return;
     const dp = c.opendir(z) orelse return;
@@ -1145,7 +1166,11 @@ fn installOpencode(ctx: *Ctx) void {
     }
 
     // 1. Plugin dir.
-    mkdirP(plugin_dir);
+    if (!mkdirP(plugin_dir)) {
+        pushFailed(ctx, "opencode", "unsafe plugin directory");
+        out("\n");
+        return;
+    }
     const plugin_src = std.fs.path.join(gpa, &.{ repo_root, "src", "plugins", "opencode" }) catch return;
     {
         const PayloadPair = struct { src: []const u8, dest: []const u8 };
@@ -1165,7 +1190,11 @@ fn installOpencode(ctx: *Ctx) void {
     out(fmt(ctx, "  installed: {s}\n", .{plugin_dir}));
 
     // 2. Commands.
-    mkdirP(commands_dir);
+    if (!mkdirP(commands_dir)) {
+        pushFailed(ctx, "opencode", "unsafe commands directory");
+        out("\n");
+        return;
+    }
     const cmd_src_dir = std.fs.path.join(gpa, &.{ plugin_src, "commands" }) catch return;
     for (OPENCODE_COMMAND_FILES) |f| {
         const s = std.fs.path.join(gpa, &.{ cmd_src_dir, f }) catch continue;
@@ -1180,7 +1209,11 @@ fn installOpencode(ctx: *Ctx) void {
     }
 
     // 3. Subagents — strip tools: via opencode_agent.stripOpencodeAgentTools.
-    mkdirP(agents_dir);
+    if (!mkdirP(agents_dir)) {
+        pushFailed(ctx, "opencode", "unsafe agents directory");
+        out("\n");
+        return;
+    }
     const agent_src_dir = std.fs.path.join(gpa, &.{ repo_root, "agents" }) catch return;
     for (OPENCODE_AGENT_FILES) |f| {
         const s = std.fs.path.join(gpa, &.{ agent_src_dir, f }) catch continue;
@@ -1197,7 +1230,11 @@ fn installOpencode(ctx: *Ctx) void {
     }
 
     // 4. Skills.
-    mkdirP(skills_dir);
+    if (!mkdirP(skills_dir)) {
+        pushFailed(ctx, "opencode", "unsafe skills directory");
+        out("\n");
+        return;
+    }
     const skill_src_dir = std.fs.path.join(gpa, &.{ repo_root, "skills" }) catch return;
     for (OPENCODE_SKILL_DIRS) |name| {
         const s = std.fs.path.join(gpa, &.{ skill_src_dir, name }) catch continue;
@@ -1214,12 +1251,25 @@ fn installOpencode(ctx: *Ctx) void {
     // 5. AGENTS.md ruleset (fenced).
     {
         const rule_path = std.fs.path.join(gpa, &.{ repo_root, "src", "rules", "caveman-activate.md" }) catch return;
-        const rule_raw = common.readFileAlloc(gpa, rule_path, 4 * 1024 * 1024) orelse "";
+        const rule_raw = common.readFileAlloc(gpa, rule_path, 4 * 1024 * 1024) orelse {
+            pushFailed(ctx, "opencode", "ruleset read failed");
+            out("\n");
+            return;
+        };
         const rule_body = std.mem.concat(gpa, u8, &.{ std.mem.trimEnd(u8, rule_raw, " \t\r\n"), "\n" }) catch return;
         const fenced = std.mem.concat(gpa, u8, &.{ OPENCODE_AGENTS_MD_BEGIN, "\n", rule_body, OPENCODE_AGENTS_MD_END, "\n" }) catch return;
 
-        if (isFileReal(agents_md)) {
-            const existing = common.readFileAlloc(gpa, agents_md, 4 * 1024 * 1024) orelse "";
+        if (common.existsNoFollow(agents_md)) {
+            if (!common.isRegularFileNoSymlink(agents_md)) {
+                pushFailed(ctx, "opencode", "unsafe AGENTS.md");
+                out("\n");
+                return;
+            }
+            const existing = common.readFileAlloc(gpa, agents_md, 4 * 1024 * 1024) orelse {
+                pushFailed(ctx, "opencode", "AGENTS.md read failed");
+                out("\n");
+                return;
+            };
             const fenced_present = std.mem.indexOf(u8, existing, OPENCODE_AGENTS_MD_BEGIN) != null and std.mem.indexOf(u8, existing, OPENCODE_AGENTS_MD_END) != null;
             const legacy = !fenced_present and std.mem.indexOf(u8, existing, OPENCODE_AGENTS_MD_SENTINEL) != null;
             if (fenced_present) {
@@ -1228,17 +1278,29 @@ fn installOpencode(ctx: *Ctx) void {
                 ctx.note(fmt(ctx, "  {s} contains a legacy (un-fenced) caveman block — leaving as-is", .{agents_md}));
                 ctx.note("  re-run with --force to replace it with a fenced block");
                 if (opts.force) {
-                    writeFile0644(agents_md, fenced) catch {};
+                    writeFile0644(agents_md, fenced) catch {
+                        pushFailed(ctx, "opencode", "AGENTS.md write failed");
+                        out("\n");
+                        return;
+                    };
                     out(fmt(ctx, "  rewrote {s} with fenced caveman block\n", .{agents_md}));
                 }
             } else {
                 const sep = if (std.mem.endsWith(u8, existing, "\n\n")) "" else if (std.mem.endsWith(u8, existing, "\n")) "\n" else "\n\n";
                 const next = std.mem.concat(gpa, u8, &.{ existing, sep, fenced }) catch return;
-                writeFile0644(agents_md, next) catch {};
+                writeFile0644(agents_md, next) catch {
+                    pushFailed(ctx, "opencode", "AGENTS.md write failed");
+                    out("\n");
+                    return;
+                };
                 out(fmt(ctx, "  appended caveman ruleset to {s}\n", .{agents_md}));
             }
         } else {
-            writeFile0644(agents_md, fenced) catch {};
+            writeFile0644(agents_md, fenced) catch {
+                pushFailed(ctx, "opencode", "AGENTS.md write failed");
+                out("\n");
+                return;
+            };
             out(fmt(ctx, "  installed: {s}\n", .{agents_md}));
         }
     }
@@ -1254,10 +1316,10 @@ fn installOpencode(ctx: *Ctx) void {
             if (isFileReal(opencode_json) and !pathExists(bak)) {
                 _ = copyFile(gpa, opencode_json, bak);
             }
-            if (doc.value != .object) doc.value = .{ .object = .{} };
+            if (doc.value != .object) doc.value = .{ .object = std.json.ObjectMap.init(arena) };
             // plugin array.
             if (doc.value.object.get("plugin") == null or doc.value.object.get("plugin").? != .array) {
-                doc.value.object.put(arena, "plugin", .{ .array = std.json.Array.init(arena) }) catch {};
+                doc.value.object.put("plugin", .{ .array = std.json.Array.init(arena) }) catch {};
             }
             const plugin_ptr = doc.value.object.getPtr("plugin").?;
             var has_plugin = false;
@@ -1268,12 +1330,12 @@ fn installOpencode(ctx: *Ctx) void {
 
             if (opts.with_mcp_shrink) {
                 if (doc.value.object.get("mcp") == null or doc.value.object.get("mcp").? != .object) {
-                    doc.value.object.put(arena, "mcp", .{ .object = .{} }) catch {};
+                    doc.value.object.put("mcp", .{ .object = std.json.ObjectMap.init(arena) }) catch {};
                 }
                 const mcp_ptr = doc.value.object.getPtr("mcp").?;
                 if (mcp_ptr.object.get("caveman-shrink") == null) {
-                    var entry: std.json.ObjectMap = .{};
-                    entry.put(arena, "type", .{ .string = "local" }) catch {};
+                    var entry = std.json.ObjectMap.init(arena);
+                    entry.put("type", .{ .string = "local" }) catch {};
                     var cmd_arr = std.json.Array.init(arena);
                     cmd_arr.append(.{ .string = "npx" }) catch {};
                     cmd_arr.append(.{ .string = "-y" }) catch {};
@@ -1282,9 +1344,9 @@ fn installOpencode(ctx: *Ctx) void {
                         var tit = std.mem.tokenizeAny(u8, joined, " ");
                         while (tit.next()) |tok| cmd_arr.append(.{ .string = arena.dupe(u8, tok) catch tok }) catch {};
                     }
-                    entry.put(arena, "command", .{ .array = cmd_arr }) catch {};
-                    entry.put(arena, "enabled", .{ .bool = true }) catch {};
-                    mcp_ptr.object.put(arena, "caveman-shrink", .{ .object = entry }) catch {};
+                    entry.put("command", .{ .array = cmd_arr }) catch {};
+                    entry.put("enabled", .{ .bool = true }) catch {};
+                    mcp_ptr.object.put("caveman-shrink", .{ .object = entry }) catch {};
                     out(fmt(ctx, "  registered caveman-shrink MCP server (wraps: {s})\n", .{opts.mcp_shrink_cmd orelse ""}));
                 }
             }
@@ -1403,7 +1465,7 @@ fn installHooks(ctx: *Ctx) []const u8 {
         return "ok";
     }
 
-    mkdirP(hooks_dir);
+    if (!mkdirP(hooks_dir)) return "mkdir hooks failed";
 
     // Copy each hook file from the local clone. The remote-download + SHA-256
     // verify fallback is DEFERRED to R4c (network path). Without a clone we
@@ -1467,10 +1529,10 @@ fn installHooks(ctx: *Ctx) []const u8 {
     {
         const sl_cmd = fmt(ctx, "bash \"{s}\"", .{statusline});
         if (doc.value == .object and doc.value.object.get("statusLine") == null) {
-            var slo: std.json.ObjectMap = .{};
-            slo.put(arena, "type", .{ .string = "command" }) catch {};
-            slo.put(arena, "command", .{ .string = sl_cmd }) catch {};
-            doc.value.object.put(arena, "statusLine", .{ .object = slo }) catch {};
+            var slo = std.json.ObjectMap.init(doc.arena);
+            slo.put("type", .{ .string = "command" }) catch {};
+            slo.put("command", .{ .string = sl_cmd }) catch {};
+            doc.value.object.put("statusLine", .{ .object = slo }) catch {};
             out("  statusline badge configured.\n");
         } else if (doc.value == .object) {
             const sl_val = doc.value.object.get("statusLine").?;
@@ -1649,7 +1711,7 @@ fn uninstall(ctx: *Ctx) void {
     }
 
     // Delete hook files.
-    if (isDirReal(hooks_dir)) {
+    if (common.classify(hooks_dir) == .dir) {
         for (HOOK_FILES) |f| {
             const p = std.fs.path.join(gpa, &.{ hooks_dir, f }) catch continue;
             if (!pathExists(p)) continue;
@@ -1713,14 +1775,14 @@ fn uninstall(ctx: *Ctx) void {
         };
         const skill = std.fs.path.join(gpa, &.{ ws, "skills", "caveman" }) catch "";
         const soul = std.fs.path.join(gpa, &.{ ws, "SOUL.md" }) catch "";
-        if (pathExists(skill) or pathExists(soul)) {
+        if (common.classify(skill) == .dir or common.isRegularFileNoSymlink(soul)) {
             // The stage-1 openclaw.uninstallOpenclaw module is silent; emit the
             // same per-file notes the JS log object produced (existence-gated,
             // dry-run wording matches bin/lib/openclaw.js uninstallOpenclaw).
-            if (pathExists(skill)) {
+            if (common.classify(skill) == .dir) {
                 ctx.note(if (opts.dry_run) fmt(ctx, "  would remove {s}/", .{skill}) else fmt(ctx, "  removed {s}", .{skill}));
             }
-            if (pathExists(soul)) {
+            if (common.isRegularFileNoSymlink(soul)) {
                 ctx.note(if (opts.dry_run) fmt(ctx, "  would strip caveman block from {s}", .{soul}) else fmt(ctx, "  stripped caveman block from {s}", .{soul}));
             }
             openclaw.uninstallOpenclaw(gpa, ws, opts.dry_run) catch {};
@@ -1735,7 +1797,7 @@ fn uninstall(ctx: *Ctx) void {
             break :blk nullclaw.resolveWorkspace(gpa) catch "";
         };
         const skill = std.fs.path.join(gpa, &.{ ws, "skills", "caveman" }) catch "";
-        if (pathExists(skill)) {
+        if (common.classify(skill) == .dir) {
             ctx.note(if (opts.dry_run) fmt(ctx, "  would remove {s}/", .{skill}) else fmt(ctx, "  removed {s}", .{skill}));
             nullclaw.uninstallNullclaw(gpa, ws, opts.dry_run) catch {};
             ctx.ok("  pruned caveman skill from NullClaw workspace");
@@ -1762,7 +1824,8 @@ fn uninstallOpencode(ctx: *Ctx) void {
     const opts = ctx.opts;
     const dir = opencodeConfigDir(gpa);
     const plugin_dir = std.fs.path.join(gpa, &.{ dir, "plugins", "caveman" }) catch return;
-    if (!pathExists(plugin_dir)) return;
+    const plugin_kind = common.classify(plugin_dir);
+    if (plugin_kind == .missing) return;
 
     const oc_json = std.fs.path.join(gpa, &.{ dir, "opencode.json" }) catch return;
     if (isFileReal(oc_json)) {
@@ -1795,8 +1858,12 @@ fn uninstallOpencode(ctx: *Ctx) void {
             ctx.ok(fmt(ctx, "  pruned caveman entries from {s}", .{oc_json}));
         }
     }
-    if (!opts.dry_run) openclaw.removeTree(gpa, plugin_dir);
-    ctx.note(fmt(ctx, "  removed {s}", .{plugin_dir}));
+    if (plugin_kind == .symlink) {
+        ctx.warn(fmt(ctx, "  left symlinked opencode plugin dir in place: {s}", .{plugin_dir}));
+    } else {
+        if (!opts.dry_run) openclaw.removeTree(gpa, plugin_dir);
+        ctx.note(fmt(ctx, "  removed {s}", .{plugin_dir}));
+    }
 
     for (OPENCODE_COMMAND_FILES) |f| {
         const p = std.fs.path.join(gpa, &.{ dir, "commands", f }) catch continue;
@@ -1814,12 +1881,12 @@ fn uninstallOpencode(ctx: *Ctx) void {
     }
     for (OPENCODE_SKILL_DIRS) |name| {
         const p = std.fs.path.join(gpa, &.{ dir, "skills", name }) catch continue;
-        if (pathExists(p) and !opts.dry_run) openclaw.removeTree(gpa, p);
+        if (common.classify(p) != .missing and !opts.dry_run) openclaw.removeTree(gpa, p);
     }
 
     // AGENTS.md fenced-block strip.
     const oc_agents = std.fs.path.join(gpa, &.{ dir, "AGENTS.md" }) catch return;
-    if (isFileReal(oc_agents)) {
+    if (common.isRegularFileNoSymlink(oc_agents)) {
         const body = common.readFileAlloc(gpa, oc_agents, 4 * 1024 * 1024) orelse return;
         const begin = std.mem.indexOf(u8, body, OPENCODE_AGENTS_MD_BEGIN);
         const end = std.mem.indexOf(u8, body, OPENCODE_AGENTS_MD_END);
@@ -2168,6 +2235,52 @@ test "detectMatch file clause" {
     // dir: on a regular file → false (isDirReal).
     const spec_dir = try std.fmt.allocPrint(gpa, "dir:{s}", .{f});
     try testing.expect(!detectMatch(gpa, spec_dir));
+}
+
+test "writeFile0644 refuses symlinked target" {
+    const gpa = testing.allocator;
+    const dir_path = try common.makeTmpDir(gpa);
+    defer gpa.free(dir_path);
+
+    const victim = try std.fs.path.join(gpa, &.{ dir_path, "victim.txt" });
+    defer gpa.free(victim);
+    const link = try std.fs.path.join(gpa, &.{ dir_path, "link.txt" });
+    defer gpa.free(link);
+    try common.writeSmall(victim, "keep\n");
+
+    var vb: [std.fs.max_path_bytes]u8 = undefined;
+    var lb: [std.fs.max_path_bytes]u8 = undefined;
+    try testing.expect(c.symlink(try common.toZ(&vb, victim), try common.toZ(&lb, link)) == 0);
+
+    try testing.expectError(error.SymlinkRefused, writeFile0644(link, "replace\n"));
+    const data = try common.readSmall(gpa, victim);
+    defer gpa.free(data);
+    try testing.expectEqualStrings("keep\n", data);
+
+    _ = c.unlink(try common.toZ(&lb, link));
+    _ = c.unlink(try common.toZ(&vb, victim));
+}
+
+test "writeFile0644 refuses symlinked parent" {
+    const gpa = testing.allocator;
+    const dir_path = try common.makeTmpDir(gpa);
+    defer gpa.free(dir_path);
+
+    const outside = try std.fs.path.join(gpa, &.{ dir_path, "outside" });
+    defer gpa.free(outside);
+    try common.mkdirPath(outside);
+    const link_parent = try std.fs.path.join(gpa, &.{ dir_path, "linked-parent" });
+    defer gpa.free(link_parent);
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    var lb: [std.fs.max_path_bytes]u8 = undefined;
+    try testing.expect(c.symlink(try common.toZ(&ob, outside), try common.toZ(&lb, link_parent)) == 0);
+
+    const target = try std.fs.path.join(gpa, &.{ link_parent, "payload.txt" });
+    defer gpa.free(target);
+    try testing.expectError(error.ParentSymlinkRefused, writeFile0644(target, "nope\n"));
+
+    _ = c.unlink(try common.toZ(&lb, link_parent));
+    _ = c.rmdir(try common.toZ(&ob, outside));
 }
 
 test "joinTokens collapses whitespace runs" {
