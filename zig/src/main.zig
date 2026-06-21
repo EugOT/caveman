@@ -28,7 +28,6 @@ const TOOL_UPPER = blk: {
     break :blk &final;
 };
 
-const c = std.c;
 const canonicalMode = common.canonicalMode;
 const isIndependentMode = common.isIndependentMode;
 const getDefaultMode = common.getDefaultMode;
@@ -37,9 +36,6 @@ const safeWriteFlag = common.safeWriteFlag;
 const unlinkFlag = common.unlinkFlag;
 const readStdin = common.readStdin;
 const writeStdout = common.writeStdout;
-
-extern "c" fn fork() c.pid_t;
-extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 
 /// Extract a top-level string field from the hook JSON. Returns an owned copy
 /// or null. Used for both "prompt" and "transcript_path".
@@ -62,50 +58,18 @@ fn extractPrompt(gpa: std.mem.Allocator, input: []const u8) ?[]u8 {
     return extractStringField(gpa, input, "prompt");
 }
 
-/// fork + pipe + capture a child's stdout into an owned buffer. Mirrors the
-/// captureSpawn pattern in install.zig. argv must be NUL-terminated slices;
-/// execvp searches $PATH (the installer puts the binaries on PATH). Returns the
-/// captured stdout (owned) or null on spawn failure. stderr is discarded.
-fn captureStdout(gpa: std.mem.Allocator, argv: []const [:0]const u8) ?[]u8 {
+/// Spawn a child, capture its stdout into an owned buffer, discard stderr.
+/// Stdlib-first: std.process.run (gpa, io) PATH-resolves argv[0] from the parent
+/// environment (same as the old execvp), opens /dev/null for the child's stdin
+/// via `stdin = .ignore`, pipes+collects stdout and stderr, then waits/reaps the
+/// child. We keep result.stdout and free result.stderr — behavior-identical to
+/// the old fork+pipe+dup2 version that captured stdout and routed stderr to
+/// /dev/null. Returns the captured stdout (owned) or null on any spawn/IO error.
+fn captureStdout(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ?[]u8 {
     if (argv.len == 0) return null;
-    var fds: [2]c.fd_t = undefined;
-    if (c.pipe(&fds) != 0) return null;
-
-    const cargv = gpa.allocSentinel(?[*:0]const u8, argv.len, null) catch {
-        _ = common.close(fds[0]);
-        _ = common.close(fds[1]);
-        return null;
-    };
-    defer gpa.free(cargv);
-    for (argv, 0..) |a, i| cargv[i] = a.ptr;
-
-    const pid = fork();
-    if (pid < 0) {
-        _ = common.close(fds[0]);
-        _ = common.close(fds[1]);
-        return null;
-    }
-    if (pid == 0) {
-        _ = c.dup2(fds[1], 1);
-        const devnull = c.open("/dev/null", .{ .ACCMODE = .WRONLY }, @as(c.mode_t, 0));
-        if (devnull >= 0) _ = c.dup2(devnull, 2);
-        _ = common.close(fds[0]);
-        _ = common.close(fds[1]);
-        _ = execvp(argv[0].ptr, cargv.ptr);
-        c._exit(127);
-    }
-    _ = common.close(fds[1]);
-    var buf: std.ArrayList(u8) = .empty;
-    var rbuf: [4096]u8 = undefined;
-    while (true) {
-        const n = c.read(fds[0], &rbuf, rbuf.len);
-        if (n <= 0) break;
-        buf.appendSlice(gpa, rbuf[0..@intCast(n)]) catch break;
-    }
-    _ = common.close(fds[0]);
-    var status: c_int = 0;
-    _ = c.waitpid(pid, &status, 0);
-    return buf.toOwnedSlice(gpa) catch null;
+    const result = std.process.run(gpa, io, .{ .argv = argv }) catch return null;
+    gpa.free(result.stderr); // discarded, as the old child redirected stderr → /dev/null
+    return result.stdout;
 }
 
 /// Append `s` to `out` as a JSON-escaped string body (between quotes).
@@ -129,7 +93,7 @@ fn appendJsonString(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []const 
 /// binary (PATH-resolved) with --session-file <transcript_path> and passthrough
 /// flags, and emit {"decision":"block","reason":<stats output>}. Mirrors
 /// caveman-mode-tracker.js lines 41-62. Returns true if handled (caller exits).
-fn handleStats(gpa: std.mem.Allocator, prompt: []const u8, input: []const u8) bool {
+fn handleStats(gpa: std.mem.Allocator, io: std.Io, prompt: []const u8, input: []const u8) bool {
     const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
     const a = "/" ++ TOOL ++ "-stats";
     const b = "/" ++ TOOL ++ ":" ++ TOOL ++ "-stats";
@@ -139,31 +103,34 @@ fn handleStats(gpa: std.mem.Allocator, prompt: []const u8, input: []const u8) bo
     if (!std.ascii.eqlIgnoreCase(first, a) and !std.ascii.eqlIgnoreCase(first, b)) return false;
 
     // Build argv: caveman-stats [--session-file <path>] [--share] [--all] [--since <v>].
-    var args: std.ArrayList([:0]const u8) = .empty;
+    // std.process.run takes plain []const u8 (it PATH-resolves argv[0] itself), so
+    // the args no longer need NUL-termination. We still dupe each element so the
+    // owned slices outlive the parsed tokens / extracted transcript_path.
+    var args: std.ArrayList([]const u8) = .empty;
     defer {
         for (args.items) |arg| gpa.free(arg);
         args.deinit(gpa);
     }
-    args.append(gpa, gpa.dupeZ(u8, TOOL ++ "-stats") catch return blockReason(gpa, statsErr())) catch return blockReason(gpa, statsErr());
+    args.append(gpa, gpa.dupe(u8, TOOL ++ "-stats") catch return blockReason(gpa, statsErr())) catch return blockReason(gpa, statsErr());
 
     if (extractStringField(gpa, input, "transcript_path")) |tp| {
         defer gpa.free(tp);
-        args.append(gpa, gpa.dupeZ(u8, "--session-file") catch return blockReason(gpa, statsErr())) catch {};
-        args.append(gpa, gpa.dupeZ(u8, tp) catch return blockReason(gpa, statsErr())) catch {};
+        args.append(gpa, gpa.dupe(u8, "--session-file") catch return blockReason(gpa, statsErr())) catch {};
+        args.append(gpa, gpa.dupe(u8, tp) catch return blockReason(gpa, statsErr())) catch {};
     }
     // Passthrough flags from the remaining tokens.
     while (it.next()) |tok| {
         if (std.mem.eql(u8, tok, "--share") or std.mem.eql(u8, tok, "--all")) {
-            args.append(gpa, gpa.dupeZ(u8, tok) catch continue) catch {};
+            args.append(gpa, gpa.dupe(u8, tok) catch continue) catch {};
         } else if (std.mem.eql(u8, tok, "--since")) {
             if (it.next()) |val| {
-                args.append(gpa, gpa.dupeZ(u8, "--since") catch continue) catch {};
-                args.append(gpa, gpa.dupeZ(u8, val) catch continue) catch {};
+                args.append(gpa, gpa.dupe(u8, "--since") catch continue) catch {};
+                args.append(gpa, gpa.dupe(u8, val) catch continue) catch {};
             }
         }
     }
 
-    const out = captureStdout(gpa, args.items) orelse return blockReason(gpa, statsErr());
+    const out = captureStdout(gpa, io, args.items) orelse return blockReason(gpa, statsErr());
     defer gpa.free(out);
     return blockReason(gpa, std.mem.trim(u8, out, " \t\r\n"));
 }
@@ -282,10 +249,34 @@ fn parseModeChange(prompt: []const u8, default_mode: []const u8) ?ModeChange {
     return parseNaturalActivation(prompt, default_mode);
 }
 
+/// Build the OS environment block for the std.Io backend. The hook spawns the
+/// stats binary via std.process.run, which PATH-resolves argv[0] from THIS
+/// block — so it must carry the inherited process environment (PATH), exactly
+/// as the old execvp did. We legacy-`pub fn main()`, so Juicy Main's wiring of
+/// std.os.environ into the global Threaded never ran; we replicate it here.
+///   - POSIX: slice over the libc `environ` global (these hooks link libc).
+///   - Windows: the PEB-backed `.global` block (no envp pointer to slice).
+fn osEnvironBlock() std.process.Environ.Block {
+    if (@import("builtin").os.tag == .windows) return .global;
+    const c_environ = std.c.environ; // [*:null]?[*:0]u8
+    var len: usize = 0;
+    while (c_environ[len] != null) : (len += 1) {}
+    const slice: [:null]const ?[*:0]const u8 = @ptrCast(c_environ[0..len :null]);
+    return .{ .slice = slice };
+}
+
 pub fn main() !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
+
+    // Construct the std.Io backend once; thread it down to every FS fn (and to
+    // std.process.run for the stats spawn). Built directly (not via
+    // common.threaded()) so it carries the inherited environment — run's PATH
+    // resolution of argv[0] reads this block, mirroring the old execvp.
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{ .environ = .{ .block = osEnvironBlock() } });
+    defer threaded.deinit();
+    const io = threaded.io();
 
     const input = readStdin(gpa) catch return; // silent-fail contract
     defer gpa.free(input);
@@ -296,9 +287,9 @@ pub fn main() !void {
     // /caveman-stats: block the prompt + inject stats output. Checked first,
     // mirroring caveman-mode-tracker.js (the stats handler runs before any
     // mode-change / reinforcement logic). Returns true if it handled the prompt.
-    if (handleStats(gpa, prompt, input)) return;
+    if (handleStats(gpa, io, prompt, input)) return;
 
-    const default_mode = getDefaultMode(gpa);
+    const default_mode = getDefaultMode(io, gpa);
 
     // Silent-fail if env is missing/invalid (e.g. no HOME) — a hook must never
     // bubble an error out of main and disturb prompt submission.
@@ -312,10 +303,10 @@ pub fn main() !void {
     if (parseModeChange(prompt, default_mode)) |change| {
         switch (change) {
             .deactivate => {
-                unlinkFlag(path);
+                unlinkFlag(io, path);
                 return; // deactivation: nothing to reinforce
             },
-            .activate => |mode| safeWriteFlag(gpa, path, mode) catch {}, // silent-fail on FS errors
+            .activate => |mode| safeWriteFlag(io, gpa, path, mode) catch {}, // silent-fail on FS errors
         }
     }
 
@@ -325,7 +316,7 @@ pub fn main() !void {
     //    with the JS hook so other plugins' competing style instructions don't
     //    drown caveman out mid-conversation.
     // readFlagMode returns a borrowed slice into VALID_MODES rodata — do NOT free.
-    const active = common.readFlagMode(gpa, path) orelse return;
+    const active = common.readFlagMode(io, gpa, path) orelse return;
     if (isIndependentMode(active)) return;
 
     var out: std.ArrayList(u8) = .empty;
