@@ -276,6 +276,78 @@ pub fn addCommandHook(arena: std.mem.Allocator, settings: *std.json.Value, event
     return true;
 }
 
+// ── addCavemanHooks (full standalone-install merge) ────────────────────────
+// Wire the three managed Zig-binary hooks + statusline into `settings`, all
+// idempotent. Mirrors the merge that bin/install.js / install.zig perform, but
+// pointed at the prebuilt Zig binaries (no node, no bash wrapper): the binaries
+// are native executables invoked directly by absolute path.
+//
+//   SessionStart    → "<hooks_dir>/caveman-activate"
+//   UserPromptSubmit→ "<hooks_dir>/caveman-hook"
+//   statusLine      → "<hooks_dir>/caveman-statusline"
+//
+// Returns how the statusline ended up so the caller can report it:
+//   .configured  — we added the caveman statusLine (none was present)
+//   .already     — a caveman statusLine was already present
+//   .skipped     — a non-caveman statusLine exists; left untouched
+pub const StatusLineResult = enum { configured, already, skipped };
+
+pub fn addCavemanHooks(arena: std.mem.Allocator, settings: *std.json.Value, hooks_dir: []const u8) !StatusLineResult {
+    if (settings.* != .object) {
+        settings.* = .{ .object = std.json.ObjectMap.init(arena) };
+    }
+
+    const activate = try std.fs.path.join(arena, &.{ hooks_dir, "caveman-activate" });
+    const hook = try std.fs.path.join(arena, &.{ hooks_dir, "caveman-hook" });
+    const statusline = try std.fs.path.join(arena, &.{ hooks_dir, "caveman-statusline" });
+
+    // The Zig hook binaries are native executables — the settings.json command is
+    // just the quoted absolute path, no interpreter prefix. Marker keys off the
+    // basename so the entry is recognized regardless of how the path was quoted.
+    const activate_cmd = try std.fmt.allocPrint(arena, "\"{s}\"", .{activate});
+    _ = try addCommandHook(arena, settings, "SessionStart", .{
+        .command = activate_cmd,
+        .marker = "caveman-activate",
+        .timeout = 5,
+        .status_message = "Loading caveman mode...",
+    });
+
+    const hook_cmd = try std.fmt.allocPrint(arena, "\"{s}\"", .{hook});
+    _ = try addCommandHook(arena, settings, "UserPromptSubmit", .{
+        .command = hook_cmd,
+        .marker = "caveman-hook",
+        .timeout = 5,
+        .status_message = "Tracking caveman mode...",
+    });
+
+    // statusLine lives outside hooks. Add only if absent; never clobber a
+    // user-defined statusline.
+    const sl_cmd = try std.fmt.allocPrint(arena, "\"{s}\"", .{statusline});
+    var result: StatusLineResult = .skipped;
+    if (settings.object.get("statusLine") == null) {
+        var slo = std.json.ObjectMap.init(arena);
+        try slo.put("type", .{ .string = "command" });
+        try slo.put("command", .{ .string = sl_cmd });
+        try settings.object.put("statusLine", .{ .object = slo });
+        result = .configured;
+    } else {
+        const sl_val = settings.object.get("statusLine").?;
+        const existing = switch (sl_val) {
+            .string => |s| s,
+            .object => |o| if (o.get("command")) |cv| (if (cv == .string) cv.string else "") else "",
+            else => "",
+        };
+        if (std.mem.indexOf(u8, existing, "caveman-statusline") != null) {
+            result = .already;
+        } else {
+            result = .skipped;
+        }
+    }
+
+    try validateHookFields(arena, settings);
+    return result;
+}
+
 // ── removeCavemanHooks ─────────────────────────────────────────────────────
 // Strip every entry whose any hook command mentions `marker`. Returns count.
 pub fn removeCavemanHooks(arena: std.mem.Allocator, settings: *std.json.Value, marker: []const u8) !usize {
@@ -318,6 +390,25 @@ pub fn removeCavemanHooks(arena: std.mem.Allocator, settings: *std.json.Value, m
     return removed;
 }
 
+// ── removeCavemanStatusLine ────────────────────────────────────────────────
+// Drop a managed statusLine (string or {command}) whose command references
+// "caveman-statusline". Mirrors the statusLine strip install.zig's uninstall
+// performs alongside removeCavemanHooks. Returns true if removed.
+pub fn removeCavemanStatusLine(settings: *std.json.Value) bool {
+    if (settings.* != .object) return false;
+    const sl = settings.object.get("statusLine") orelse return false;
+    const cmd = switch (sl) {
+        .string => |s| s,
+        .object => |o| if (o.get("command")) |cv| (if (cv == .string) cv.string else "") else "",
+        else => "",
+    };
+    if (std.mem.indexOf(u8, cmd, "caveman-statusline") != null) {
+        _ = settings.object.orderedRemove("statusLine");
+        return true;
+    }
+    return false;
+}
+
 // JS keeps an entry whose hooks array is absent/malformed (filter returns true),
 // drops it only when SOME hook command includes the marker.
 fn entryMentionsMarker(entry: std.json.Value, marker: []const u8) bool {
@@ -336,11 +427,17 @@ fn entryMentionsMarker(entry: std.json.Value, marker: []const u8) bool {
 }
 
 pub const MANAGED_HOOK_BASENAMES = [_][]const u8{
+    // Legacy JS/shell hook filenames (pre-R6.3 standalone installs).
     "caveman-activate.js",
     "caveman-mode-tracker.js",
     "caveman-stats.js",
     "caveman-statusline.sh",
     "caveman-statusline.ps1",
+    // R6.3 pure-Zig hook binaries (native executables, no extension).
+    "caveman-activate",
+    "caveman-hook",
+    "caveman-stats",
+    "caveman-statusline",
 };
 
 fn isManagedBasename(name: []const u8) bool {
@@ -630,6 +727,11 @@ pub fn stringifySettings(gpa: std.mem.Allocator, value: std.json.Value) ![]u8 {
 //   caveman-settings prune [configDir]      → parse, pruneOrphanedManagedHooks, print
 //   caveman-settings remove [marker]        → parse, removeCavemanHooks, print
 //   caveman-settings rewrite <absNode>      → parse, rewriteLegacyManagedHookCommands, print
+//   caveman-settings add <hooksDir>         → parse, wire Zig hook binaries +
+//                                             statusline (idempotent), print.
+//                                             statusline state → exit code:
+//                                             0 configured, 0 already, 0 skipped;
+//                                             a one-line note on stderr.
 // For mutating ops the printed JSON is the post-mutation document.
 // 0.16 entry shape: the no-alloc POSIX arg iterator (init, not std.Io) keeps us
 // on the libc C-ABI surface like the rest of the hook tree (stats.zig).
@@ -656,7 +758,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     if (argv.items.len < 1) {
-        writeStderr("usage: caveman-settings <strip|validate|prune|remove|rewrite> [arg]\n");
+        writeStderr("usage: caveman-settings <strip|validate|prune|remove|rewrite|add> [arg]\n");
         std.process.exit(2);
     }
     const cmd = argv.items[0];
@@ -682,12 +784,29 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } else if (std.mem.eql(u8, cmd, "remove")) {
         const marker: []const u8 = if (argv.items.len >= 2) argv.items[1] else "caveman";
         _ = try removeCavemanHooks(arena, &value, marker);
+        // Also drop a managed caveman statusLine — install.zig's uninstall path
+        // strips it alongside the hooks, so the CLI surface must too for the
+        // shell uninstaller to reach full parity.
+        _ = removeCavemanStatusLine(&value);
     } else if (std.mem.eql(u8, cmd, "rewrite")) {
         if (argv.items.len < 2) {
             writeStderr("caveman-settings rewrite requires <absoluteNode>\n");
             std.process.exit(2);
         }
         _ = try rewriteLegacyManagedHookCommands(arena, &value, argv.items[1]);
+    } else if (std.mem.eql(u8, cmd, "add")) {
+        if (argv.items.len < 2) {
+            writeStderr("caveman-settings add requires <hooksDir>\n");
+            std.process.exit(2);
+        }
+        const sl = try addCavemanHooks(arena, &value, argv.items[1]);
+        // Report statusline state on stderr — stdout must stay pure JSON so the
+        // installer can capture it. The shell echoes these to the user.
+        switch (sl) {
+            .configured => writeStderr("  statusline badge configured.\n"),
+            .already => writeStderr("  statusline badge already configured.\n"),
+            .skipped => writeStderr("  note: existing statusline detected — caveman badge NOT added.\n"),
+        }
     } else {
         writeStderr("caveman-settings: unknown command\n");
         std.process.exit(2);
@@ -848,6 +967,52 @@ test "addCommandHook is idempotent on substring marker" {
     try testing.expectEqual(@as(usize, 1), v.object.get("hooks").?.object.get("SessionStart").?.array.items.len);
 }
 
+test "addCavemanHooks wires the three Zig hook binaries + statusline" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = try parse(a, "{}");
+    const sl = try addCavemanHooks(a, &v, "/home/u/.claude/hooks");
+    try testing.expectEqual(StatusLineResult.configured, sl);
+
+    // SessionStart → caveman-activate (quoted absolute path, no interpreter).
+    const ss = v.object.get("hooks").?.object.get("SessionStart").?.array;
+    try testing.expectEqual(@as(usize, 1), ss.items.len);
+    const ss_cmd = ss.items[0].object.get("hooks").?.array.items[0].object.get("command").?.string;
+    try testing.expectEqualStrings("\"/home/u/.claude/hooks/caveman-activate\"", ss_cmd);
+
+    // UserPromptSubmit → caveman-hook.
+    const ups = v.object.get("hooks").?.object.get("UserPromptSubmit").?.array;
+    const ups_cmd = ups.items[0].object.get("hooks").?.array.items[0].object.get("command").?.string;
+    try testing.expectEqualStrings("\"/home/u/.claude/hooks/caveman-hook\"", ups_cmd);
+
+    // statusLine → caveman-statusline.
+    const slc = v.object.get("statusLine").?.object.get("command").?.string;
+    try testing.expectEqualStrings("\"/home/u/.claude/hooks/caveman-statusline\"", slc);
+}
+
+test "addCavemanHooks is idempotent (re-add adds nothing)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = try parse(a, "{}");
+    _ = try addCavemanHooks(a, &v, "/h");
+    const sl2 = try addCavemanHooks(a, &v, "/h");
+    try testing.expectEqual(StatusLineResult.already, sl2);
+    try testing.expectEqual(@as(usize, 1), v.object.get("hooks").?.object.get("SessionStart").?.array.items.len);
+    try testing.expectEqual(@as(usize, 1), v.object.get("hooks").?.object.get("UserPromptSubmit").?.array.items.len);
+}
+
+test "addCavemanHooks never clobbers a non-caveman statusLine" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = try parse(a, "{\"statusLine\":{\"type\":\"command\",\"command\":\"my-prompt.sh\"}}");
+    const sl = try addCavemanHooks(a, &v, "/h");
+    try testing.expectEqual(StatusLineResult.skipped, sl);
+    try testing.expectEqualStrings("my-prompt.sh", v.object.get("statusLine").?.object.get("command").?.string);
+}
+
 test "hasCavemanHook detects via substring" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -881,6 +1046,23 @@ test "removeCavemanHooks strips by marker and cleans empties" {
     try testing.expectEqual(@as(usize, 2), removed);
     try testing.expectEqual(@as(usize, 1), v.object.get("hooks").?.object.get("SessionStart").?.array.items.len);
     try testing.expect(v.object.get("hooks").?.object.get("UserPromptSubmit") == null);
+}
+
+test "removeCavemanStatusLine drops managed statusLine, keeps user one" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Managed (Zig binary path) → removed.
+    var v1 = try parse(a, "{\"statusLine\":{\"type\":\"command\",\"command\":\"\\\"/h/caveman-statusline\\\"\"}}");
+    try testing.expect(removeCavemanStatusLine(&v1));
+    try testing.expect(v1.object.get("statusLine") == null);
+    // Legacy shell path → also removed (substring match).
+    var v2 = try parse(a, "{\"statusLine\":{\"type\":\"command\",\"command\":\"bash /h/caveman-statusline.sh\"}}");
+    try testing.expect(removeCavemanStatusLine(&v2));
+    // User statusline → preserved.
+    var v3 = try parse(a, "{\"statusLine\":{\"type\":\"command\",\"command\":\"my-prompt.sh\"}}");
+    try testing.expect(!removeCavemanStatusLine(&v3));
+    try testing.expect(v3.object.get("statusLine") != null);
 }
 
 test "rewriteLegacyManagedHookCommands rewrites bare-node managed scripts" {

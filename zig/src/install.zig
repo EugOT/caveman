@@ -1174,7 +1174,11 @@ fn installOpencode(ctx: *Ctx) void {
         const payload = [_]PayloadPair{
             .{ .src = std.fs.path.join(gpa, &.{ plugin_src, "plugin.js" }) catch return, .dest = std.fs.path.join(gpa, &.{ plugin_dir, "plugin.js" }) catch return },
             .{ .src = std.fs.path.join(gpa, &.{ plugin_src, "package.json" }) catch return, .dest = std.fs.path.join(gpa, &.{ plugin_dir, "package.json" }) catch return },
-            .{ .src = std.fs.path.join(gpa, &.{ repo_root, "src", "hooks", "caveman-config.js" }) catch return, .dest = std.fs.path.join(gpa, &.{ plugin_dir, "caveman-config.cjs" }) catch return },
+            // The opencode flag-helper shim now lives next to plugin.js as its
+            // canonical source (src/plugins/opencode/caveman-config.cjs) after the
+            // pure-Zig cutover (R6.4) deleted src/hooks/caveman-config.js. Copy it
+            // straight from the plugin dir — same name, no rename needed.
+            .{ .src = std.fs.path.join(gpa, &.{ plugin_src, "caveman-config.cjs" }) catch return, .dest = std.fs.path.join(gpa, &.{ plugin_dir, "caveman-config.cjs" }) catch return },
         };
         for (payload) |p| {
             if (isFileReal(io, p.dest) and !opts.force) {
