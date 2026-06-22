@@ -1,0 +1,127 @@
+name: Test & Coverage
+
+# Runs the full caveman test suite + coverage + mutation gates on the self-hosted
+# runners (which have nix/GitHub-API access for the flake toolchain). PRs to
+# dev/main fail below threshold. Mutation runs changed-files-only on PRs (fast)
+# and full on a nightly schedule / manual dispatch.
+#
+# Toolchain comes from the project flake devShell (flake.nix): kcov, zig, bun,
+# python(coverage). JS mutation (Stryker) + Python mutation (cosmic-ray) run via
+# bunx / pixi per repo tooling policy.
+
+on:
+  pull_request:
+    branches: [dev, main]
+  push:
+    branches: [dev]
+  schedule:
+    - cron: "0 4 * * *" # nightly full mutation run
+  workflow_dispatch:
+    inputs:
+      full_mutation:
+        description: "Run full (not changed-files-only) mutation"
+        type: boolean
+        default: false
+
+concurrency:
+  group: test-coverage-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Zig: build matrix + tests + coverage ────────────────────────────────────
+  zig:
+    runs-on: [self-hosted, linux]
+    strategy:
+      matrix:
+        tool: [caveman, ponytail]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Native build
+        run: nix develop --command bash -c "cd zig && zig build -Dtool=${{ matrix.tool }}"
+
+      - name: Cross-compile (linux + arm-linux; windows allowed-fail until R6-Windows)
+        run: |
+          nix develop --command bash -c "cd zig && zig build -Dtool=${{ matrix.tool }} -Dtarget=x86_64-linux-gnu"
+          nix develop --command bash -c "cd zig && zig build -Dtool=${{ matrix.tool }} -Dtarget=aarch64-linux-musl"
+
+      - name: Cross-compile windows (allowed to fail — deferred non-FS-core libc)
+        continue-on-error: true
+        run: nix develop --command bash -c "cd zig && zig build -Dtool=${{ matrix.tool }} -Dtarget=x86_64-windows-gnu"
+
+      - name: Unit + functional + regression + differential + e2e
+        run: nix develop --command bash -c "TOOL=${{ matrix.tool }} tests/run-all.sh"
+
+      - name: Coverage (kcov, line+branch)
+        run: nix develop --command bash -c "cd zig && zig build test -Dtool=${{ matrix.tool }} -Dtest-coverage && zig build coverage-merge -Dtest-coverage"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zig-coverage-${{ matrix.tool }}
+          path: zig/zig-out/coverage/
+          if-no-files-found: warn
+
+  # ── Zig mutation gate (the "meaningful" gate) ───────────────────────────────
+  zig-mutation:
+    runs-on: [self-hosted, linux]
+    needs: zig
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need base ref for changed-files mutation
+
+      - name: Determine mutation scope
+        id: scope
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.full_mutation }}" = "true" ]; then
+            echo "files=$(ls zig/src/*.zig | grep -v claw_tests | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+          else
+            # PR / push: only changed zig/src files (fast).
+            base="${{ github.event.pull_request.base.sha || github.event.before }}"
+            changed=$(git diff --name-only "$base" HEAD -- 'zig/src/*.zig' | grep -v claw_tests | tr '\n' ' ')
+            echo "files=$changed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run zig-mutate (gate ≥90% kill, every survivor triaged)
+        if: steps.scope.outputs.files != ''
+        run: |
+          rc=0
+          for f in ${{ steps.scope.outputs.files }}; do
+            echo "::group::mutate $f"
+            nix develop --command bash -c "tooling/mutate/zig-mutate $f --json reports/mutation/$(basename $f).json" || rc=1
+            echo "::endgroup::"
+          done
+          exit $rc
+
+      - name: Upload mutation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zig-mutation-reports
+          path: reports/mutation/
+          if-no-files-found: ignore
+
+  # ── JS oracle: coverage (non-blocking) + opencode-shim mutation (blocking) ──
+  js:
+    runs-on: [self-hosted, linux]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: JS coverage (c8, oracle baseline — report only)
+        run: nix develop --command bash -c "bunx c8 --config .c8rc.json node --test tests/installer/*.test.mjs"
+
+      - name: Mutation gate for the SURVIVING opencode shim (break=90)
+        run: nix develop --command bash -c "bunx @stryker-mutator/core run --mutate 'src/plugins/opencode/**/*.js' --break 90"
+
+  # ── Python oracle: coverage (report only) ───────────────────────────────────
+  python:
+    runs-on: [self-hosted, linux]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python coverage (coverage.py, oracle baseline)
+        run: nix develop --command bash -c "pixi run cov"
