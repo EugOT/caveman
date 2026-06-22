@@ -1,0 +1,29 @@
+[workspace]
+name = "caveman-compress-tests"
+version = "0.1.0"
+description = "Python test/coverage/mutation env for the caveman-compress oracle surface (skills/caveman-compress/scripts). Retiring with R6b — kept as a differential oracle for the Zig port."
+channels = ["conda-forge"]
+platforms = ["osx-arm64", "osx-64", "linux-64", "linux-aarch64"]
+
+[dependencies]
+python = ">=3.10"
+
+[pypi-dependencies]
+coverage = ">=7.0"
+cosmic-ray = ">=8.3"
+
+[tasks]
+# Run the Python oracle tests (standalone scripts — no pytest dependency).
+test = { cmd = "python tests/test_compress_safety.py && python tests/test_validate_inline.py && python tests/test_hooks.py" }
+# Line+branch coverage over the compress scripts (runs each standalone test under
+# coverage, appending into one report). HTML → coverage/python.
+cov = { cmd = """
+coverage erase &&
+coverage run --branch --source=skills/caveman-compress/scripts tests/test_validate_inline.py &&
+coverage run --branch --append --source=skills/caveman-compress/scripts tests/test_compress_safety.py &&
+coverage report &&
+coverage html -d coverage/python
+""" }
+# Mutation testing (cosmic-ray) — config in cosmic-ray.toml. Non-blocking oracle gate.
+mutate-init = "cosmic-ray init cosmic-ray.toml cosmic-ray.sqlite"
+mutate = "cosmic-ray exec cosmic-ray.toml cosmic-ray.sqlite && cr-report cosmic-ray.sqlite"
