@@ -19,7 +19,10 @@
     "node": ">=18"
   },
   "scripts": {
-    "test": "node --test tests/installer/*.test.mjs"
+    "test": "node --test tests/installer/*.test.mjs",
+    "cov": "bunx c8 --config .c8rc.json node --test tests/installer/*.test.mjs",
+    "mutate": "bunx @stryker-mutator/core run",
+    "mutate:opencode": "bunx @stryker-mutator/core run --mutate 'src/plugins/opencode/**/*.js' --break 90"
   },
   "files": [
     "bin/",

@@ -16,3 +16,15 @@ dist/*
 zig/.zig-cache/
 zig/zig-out/
 zig/scripts/
+
+# Test / coverage / mutation tooling artifacts + caches
+coverage/
+.coverage
+.coverage.*
+.nyc_output/
+.stryker-tmp/
+cosmic-ray.sqlite
+.pixi/
+bun.lock
+node_modules/
+reports/mutation/

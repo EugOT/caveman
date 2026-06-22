@@ -1,0 +1,11 @@
+[cosmic-ray]
+# Python mutation testing for the caveman-compress oracle surface. Run via pixi:
+#   pixi run mutate-init && pixi run mutate
+# JS/Py are retiring (R6b) so this is the ORACLE/parity gate, non-blocking.
+module-path = "skills/caveman-compress/scripts"
+timeout = 30.0
+excluded-modules = ["__main__.py", "__init__.py", "benchmark.py"]
+test-command = "python tests/test_compress_safety.py && python tests/test_validate_inline.py"
+
+[cosmic-ray.distributor]
+name = "local"
