@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.
 irm https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.ps1 | iex
 ```
 
-> Piping a script straight into a shell runs it sight-unseen. If you'd rather read it first, download then run: `curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.sh -o install.sh` (review it) `&& bash install.sh`. The installer downloads hook files from a pinned release tag and verifies them against a committed SHA-256 manifest before writing.
+> Piping a script straight into a shell runs it sight-unseen. If you'd rather read it first, download then run: `curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.sh -o install.sh` (review it) `&& bash install.sh`. The installer downloads the prebuilt caveman Zig binaries for your platform from the latest GitHub Release, SHA-256-verifies the archive, and runs `caveman-install` (no Node, no Zig toolchain required).
 
 What it does:
 
@@ -42,13 +42,13 @@ If you want to install for one agent (or want to know exactly what command runs 
 | **Claude Code** | `claude plugin marketplace add JuliusBrussee/caveman && claude plugin install caveman@caveman` | Yes |
 | **Gemini CLI** | `gemini extensions install https://github.com/JuliusBrussee/caveman` | Yes |
 | **opencode** | `caveman --only opencode` *(or `bash install.sh --only opencode`)* | Yes (plugin + AGENTS.md) |
-| **OpenClaw** | `npx -y github:JuliusBrussee/caveman -- --only openclaw` | Yes (workspace skill + SOUL.md) |
-| **NullClaw** | `npx -y github:JuliusBrussee/caveman -- --only nullclaw` | Yes (workspace skill with `always: true`) |
+| **OpenClaw** | `bash install.sh --only openclaw` *(or `curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.sh \| bash -s -- --only openclaw`)* | Yes (workspace skill + SOUL.md) |
+| **NullClaw** | `bash install.sh --only nullclaw` *(or `… \| bash -s -- --only nullclaw`)* | Yes (workspace skill with `always: true`) |
 | **Codex CLI / Codex app** | `npx skills add JuliusBrussee/caveman -a codex` *(aliases: `codex-cli`, `codex-app`)* | Per-session: `/caveman`; add `--with-init` for `AGENTS.md` + `.agents/skills/` + `.codex/skills/` |
 | **Cursor** | `npx skills add JuliusBrussee/caveman -a cursor` | Per-session by default; `--with-init` for an always-on rule file |
 | **Windsurf** | `npx skills add JuliusBrussee/caveman -a windsurf` | Per-session by default; `--with-init` for an always-on rule file |
 | **Cline** | `npx skills add JuliusBrussee/caveman -a cline` | Per-session by default; `--with-init` for an always-on rule file |
-| **GitHub Copilot** *(soft probe)* | `npx -y github:JuliusBrussee/caveman -- --only copilot --with-init` | Repo-wide instructions via `--with-init` |
+| **GitHub Copilot** *(soft probe)* | `bash install.sh --only copilot --with-init` *(or `… \| bash -s -- --only copilot --with-init`)* | Repo-wide instructions via `--with-init` |
 | **Continue** | `npx skills add JuliusBrussee/caveman -a continue` | No — say `/caveman` |
 | **Kilo Code** | `npx skills add JuliusBrussee/caveman -a kilo` | No |
 | **Roo Code** | `npx skills add JuliusBrussee/caveman -a roo` | No |
@@ -196,7 +196,9 @@ Statusline should show `[CAVEMAN]` (orange) at the bottom of Claude Code. After 
 ## Uninstall
 
 ```bash
-npx -y github:JuliusBrussee/caveman -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.sh | bash -s -- --uninstall
+# or, from a clone:
+bash install.sh --uninstall
 ```
 
 What it removes:

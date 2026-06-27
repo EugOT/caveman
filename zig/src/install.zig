@@ -46,15 +46,17 @@ extern "c" fn close(fd: c_int) c_int;
 pub const REPO = "JuliusBrussee/caveman";
 pub const MCP_SHRINK_PKG = "caveman-shrink";
 
-// Hook files copied by installHooks (local-clone path). Mirrors HOOK_FILES.
-const HOOK_FILES = [_][]const u8{
-    "package.json",
-    "caveman-config.js",
-    "caveman-activate.js",
-    "caveman-mode-tracker.js",
-    "caveman-stats.js",
-    "caveman-statusline.sh",
-    "caveman-statusline.ps1",
+// The four prebuilt Zig hook binaries deployed into $CLAUDE_CONFIG_DIR/hooks by
+// installHooks. These ship in the release archive (next to caveman-install) and
+// in a clone's zig/zig-out/bin — installHooks resolves the directory holding
+// them and copies these, no src/hooks/*.js (those were deleted in the R6.4
+// pure-Zig cutover). caveman-settings is an install-time helper (the settings
+// merge), NOT a hook — it is NOT deployed into the hooks dir.
+const HOOK_BINS = [_][]const u8{
+    "caveman-activate",
+    "caveman-hook",
+    "caveman-statusline",
+    "caveman-stats",
 };
 
 // ── Aliases & init-target sets (mirror PROVIDER_ALIASES / INIT_*) ─────────────
@@ -705,6 +707,51 @@ fn detectRepoRoot(io: std.Io, gpa: std.mem.Allocator) ?[]const u8 {
     return null;
 }
 
+// ── Self binary directory resolution (sibling caveman-* binaries) ─────────────
+/// Resolve the directory holding the sibling caveman-* binaries from argv[0].
+///
+/// install.sh / install.ps1 exec caveman-install by an ABSOLUTE path — either
+/// the unpacked release archive temp dir (where caveman-init and the four hook
+/// binaries sit beside caveman-install) or zig/zig-out/bin in a clone (likewise).
+/// So argv[0]'s dirname is the binary directory in both supported launch paths.
+/// Returns null when argv[0] carries no path component (bare-name PATH lookup,
+/// which the supported launchers never do) or the dir isn't real.
+fn selfBinDirFromArgv0(io: std.Io, gpa: std.mem.Allocator, argv0: []const u8) ?[]const u8 {
+    if (argv0.len == 0) return null;
+    // No separator ⇒ resolved off $PATH; we can't locate siblings. The supported
+    // launchers always exec an absolute path, so this only trips on an unusual
+    // manual invocation — callers fall back to the clone path.
+    if (std.mem.indexOfScalar(u8, argv0, std.fs.path.sep) == null) return null;
+    const dir = std.fs.path.dirname(argv0) orelse return null;
+    // Make absolute if argv0 was relative (e.g. ./caveman-install): join cwd.
+    const abs = if (std.fs.path.isAbsolute(dir)) gpa.dupe(u8, dir) catch return null else blk: {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd_z = c.getcwd(&cwd_buf, cwd_buf.len) orelse return null;
+        const cwd = std.mem.sliceTo(cwd_z, 0);
+        break :blk std.fs.path.join(gpa, &.{ cwd, dir }) catch return null;
+    };
+    if (!isDirReal(io, abs)) return null;
+    return abs;
+}
+
+/// Resolve a sibling caveman-* binary (e.g. "caveman-init") to an absolute path.
+/// Prefers a clone's zig/zig-out/bin (freshest local build), then the directory
+/// this binary was launched from (release archive or zig-out). Returns null when
+/// neither location holds an executable of that name — caller decides the error.
+fn resolveBin(ctx: *Ctx, name: []const u8) ?[]const u8 {
+    const gpa = ctx.gpa;
+    const io = ctx.io;
+    if (ctx.repo_root) |root| {
+        const p = std.fs.path.join(gpa, &.{ root, "zig", "zig-out", "bin", name }) catch null;
+        if (p != null and isFileReal(io, p.?)) return p.?;
+    }
+    if (ctx.self_bin_dir) |bd| {
+        const p = std.fs.path.join(gpa, &.{ bd, name }) catch null;
+        if (p != null and isFileReal(io, p.?)) return p.?;
+    }
+    return null;
+}
+
 // ── Filesystem helpers ────────────────────────────────────────────────────────
 fn mkdirP(io: std.Io, dir: []const u8) bool {
     if (common.ancestorUnsafe(io, dir)) return false;
@@ -796,6 +843,14 @@ const Ctx = struct {
     opts: *Opts,
     config_dir: []const u8,
     repo_root: ?[]const u8,
+    // Directory holding the sibling caveman-* binaries (caveman-init, the four
+    // hook binaries). Resolved from argv[0] in main(): in the release archive
+    // every caveman-* binary unpacks into one temp dir and install.sh execs
+    // caveman-install by its absolute path; in a clone the launcher execs
+    // zig/zig-out/bin/caveman-install — same directory holds the siblings. Used
+    // by installHooks (deploy hook binaries) and runInit (exec caveman-init)
+    // when no clone source tree is available.
+    self_bin_dir: ?[]const u8,
     results: *Results,
     color: Chalk,
 
@@ -1134,8 +1189,14 @@ fn installOpencode(ctx: *Ctx) void {
     ctx.say("→ opencode detected");
 
     const repo_root = ctx.repo_root orelse {
-        ctx.warn("  opencode native install requires a local clone of the caveman repo.");
-        ctx.note("  Re-run from a clone: git clone https://github.com/" ++ REPO ++ " && cd caveman && node bin/install.js --only opencode");
+        // The opencode native install copies JS plugin source (plugin.js +
+        // caveman-config.cjs), command/agent markdown, skill directories, and the
+        // AGENTS.md rule body — none of which are binaries, so they are NOT in the
+        // release archive. A clone is required. (No download path yet; if added,
+        // installOpencode would fetch those text assets from the release/raw URL.)
+        ctx.warn("  opencode native install requires a local clone of the caveman repo");
+        ctx.warn("  (it copies the JS plugin + skills/agents/commands, not shipped in the release archive).");
+        ctx.note("  Re-run from a clone: git clone https://github.com/" ++ REPO ++ " && cd caveman && bash install.sh --only opencode");
         pushFailed(ctx, "opencode", "native install requires local repo clone");
         out("\n");
         return;
@@ -1450,19 +1511,39 @@ fn readRepoFile(ctx: *Ctx, rel: []const u8) ?[]u8 {
     return common.readFileAlloc(ctx.io, ctx.gpa, full, 16 * 1024 * 1024);
 }
 
-// ── installHooks (local-clone copy path; download DEFERRED to R4c) ────────────
+// ── installHooks (deploy prebuilt Zig hook binaries + wire settings.json) ─────
+// Deploys the four native hook binaries (caveman-activate / caveman-hook /
+// caveman-statusline / caveman-stats) from the resolved binary directory (a
+// clone's zig/zig-out/bin, or the unpacked release archive this binary was
+// launched from) into $CLAUDE_CONFIG_DIR/hooks, then wires SessionStart +
+// UserPromptSubmit + statusLine into settings.json via settings.addCavemanHooks.
+// No node, no src/hooks/*.js — those were deleted in the R6.4 pure-Zig cutover.
 fn installHooks(ctx: *Ctx) []const u8 {
     const gpa = ctx.gpa;
     const io = ctx.io;
     const opts = ctx.opts;
     const hooks_dir = std.fs.path.join(gpa, &.{ ctx.config_dir, "hooks" }) catch return "alloc failed";
     const settings_path = std.fs.path.join(gpa, &.{ ctx.config_dir, "settings.json" }) catch return "alloc failed";
-    const source_dir: ?[]const u8 = if (ctx.repo_root) |r| std.fs.path.join(gpa, &.{ r, "src", "hooks" }) catch null else null;
+
+    // Resolve the source dir holding the prebuilt hook binaries: clone's
+    // zig/zig-out/bin first, else the dir this binary was launched from (archive
+    // temp dir or zig-out). Require every hook binary to be present there.
+    const bin_dir: ?[]const u8 = blk: {
+        if (resolveBin(ctx, HOOK_BINS[0])) |first| break :blk std.fs.path.dirname(first);
+        break :blk null;
+    };
+    if (bin_dir == null) {
+        return "hook binaries not found beside caveman-install (run install.sh, or from a built clone)";
+    }
+    for (HOOK_BINS) |b| {
+        const s = std.fs.path.join(gpa, &.{ bin_dir.?, b }) catch return "alloc failed";
+        if (!isFileReal(io, s)) return fmt(ctx, "hook binary missing from release/clone: {s}", .{b});
+    }
 
     if (opts.dry_run) {
         ctx.note(fmt(ctx, "  would mkdir -p {s}", .{hooks_dir}));
-        for (HOOK_FILES) |f| {
-            const d = std.fs.path.join(gpa, &.{ hooks_dir, f }) catch continue;
+        for (HOOK_BINS) |b| {
+            const d = std.fs.path.join(gpa, &.{ hooks_dir, b }) catch continue;
             ctx.note(fmt(ctx, "  would install {s}", .{d}));
         }
         ctx.note(fmt(ctx, "  would merge SessionStart + UserPromptSubmit + statusline into {s}", .{settings_path}));
@@ -1471,30 +1552,21 @@ fn installHooks(ctx: *Ctx) []const u8 {
 
     if (!mkdirP(io, hooks_dir)) return "mkdir hooks failed";
 
-    // Copy each hook file from the local clone. The remote-download + SHA-256
-    // verify fallback is DEFERRED to R4c (network path). Without a clone we
-    // cannot proceed.
-    for (HOOK_FILES) |f| {
-        const dest = std.fs.path.join(gpa, &.{ hooks_dir, f }) catch return "alloc failed";
-        const src: ?[]const u8 = if (source_dir) |sd| std.fs.path.join(gpa, &.{ sd, f }) catch null else null;
-        if (src != null and isFileReal(io, src.?)) {
-            if (!copyFile(io, gpa, src.?, dest)) return fmt(ctx, "copy {s} failed", .{f});
-        } else {
-            return fmt(ctx, "download {s} not supported in this build (R4c) — run from a local clone", .{f});
-        }
+    // Deploy each hook binary, then chmod 0755 (executables, invoked directly).
+    for (HOOK_BINS) |b| {
+        const src = std.fs.path.join(gpa, &.{ bin_dir.?, b }) catch return "alloc failed";
+        const dest = std.fs.path.join(gpa, &.{ hooks_dir, b }) catch return "alloc failed";
+        if (!copyFile(io, gpa, src, dest)) return fmt(ctx, "copy {s} failed", .{b});
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (common.toZ(&buf, dest)) |z| {
+            _ = c.chmod(z, 0o755);
+        } else |_| {}
         out(fmt(ctx, "  installed: {s}\n", .{dest}));
     }
 
-    // chmod statusline.sh 0755.
-    {
-        const sl = std.fs.path.join(gpa, &.{ hooks_dir, "caveman-statusline.sh" }) catch hooks_dir;
-        var b: [std.fs.max_path_bytes]u8 = undefined;
-        if (common.toZ(&b, sl)) |z| {
-            _ = c.chmod(z, 0o755);
-        } else |_| {}
-    }
-
-    // Merge into settings.json.
+    // Merge into settings.json via settings.addCavemanHooks (binary paths, no
+    // interpreter). Same idempotent merge install.sh drives through
+    // caveman-settings.
     var doc = readSettingsDoc(io, gpa, settings_path) orelse {
         ctx.warn("  settings.json unparseable; will not touch it. Edit manually then re-run.");
         return "settings.json unparseable";
@@ -1508,76 +1580,21 @@ fn installHooks(ctx: *Ctx) []const u8 {
         if (isFileReal(io, settings_path) and !pathExists(io, bak)) _ = copyFile(io, gpa, settings_path, bak);
     }
 
-    const node = nodePath(gpa);
-    const activate = std.fs.path.join(gpa, &.{ hooks_dir, "caveman-activate.js" }) catch hooks_dir;
-    const tracker = std.fs.path.join(gpa, &.{ hooks_dir, "caveman-mode-tracker.js" }) catch hooks_dir;
-    const statusline = std.fs.path.join(gpa, &.{ hooks_dir, "caveman-statusline.sh" }) catch hooks_dir;
-
-    _ = settings.rewriteLegacyManagedHookCommands(arena, &doc.value, node) catch 0;
-
-    _ = settings.addCommandHook(arena, &doc.value, "SessionStart", .{
-        .command = fmt(ctx, "\"{s}\" \"{s}\"", .{ node, activate }),
-        .marker = "caveman-activate",
-        .timeout = 5,
-        .status_message = "Loading caveman mode...",
-    }) catch {};
-
-    _ = settings.addCommandHook(arena, &doc.value, "UserPromptSubmit", .{
-        .command = fmt(ctx, "\"{s}\" \"{s}\"", .{ node, tracker }),
-        .marker = "caveman-mode-tracker",
-        .timeout = 5,
-        .status_message = "Tracking caveman mode...",
-    }) catch {};
-
-    // Statusline (POSIX: bash "<statusline>"). Windows path is out of scope.
-    {
-        const sl_cmd = fmt(ctx, "bash \"{s}\"", .{statusline});
-        if (doc.value == .object and doc.value.object.get("statusLine") == null) {
-            var slo = std.json.ObjectMap.init(doc.arena);
-            slo.put("type", .{ .string = "command" }) catch {};
-            slo.put("command", .{ .string = sl_cmd }) catch {};
-            doc.value.object.put("statusLine", .{ .object = slo }) catch {};
-            out("  statusline badge configured.\n");
-        } else if (doc.value == .object) {
-            const sl_val = doc.value.object.get("statusLine").?;
-            const existing = switch (sl_val) {
-                .string => |s| s,
-                .object => |o| if (o.get("command")) |cv| (if (cv == .string) cv.string else "") else "",
-                else => "",
-            };
-            if (std.mem.indexOf(u8, existing, statusline) != null or std.mem.indexOf(u8, existing, "caveman-statusline") != null) {
-                out("  statusline badge already configured.\n");
-            } else {
-                out("  NOTE: existing statusline detected — caveman badge NOT added.\n");
-                out("        See src/hooks/README.md to add the badge to your existing statusline.\n");
-            }
-        }
+    const sl = settings.addCavemanHooks(arena, &doc.value, hooks_dir) catch {
+        return "settings merge failed";
+    };
+    switch (sl) {
+        .configured => out("  statusline badge configured.\n"),
+        .already => out("  statusline badge already configured.\n"),
+        .skipped => {
+            out("  NOTE: existing statusline detected — caveman badge NOT added.\n");
+            out("        See src/hooks/README.md to add the badge to your existing statusline.\n");
+        },
     }
 
-    settings.validateHookFields(arena, &doc.value) catch {};
     writeSettingsFile(io, gpa, settings_path, doc.value) catch {};
     out(fmt(ctx, "  hooks wired in {s}\n", .{settings_path}));
     return "ok";
-}
-
-fn nodePath(gpa: std.mem.Allocator) []const u8 {
-    // The JS installer uses process.execPath — the absolute path to the node
-    // binary running it — so hooks/init are invoked with an explicit interpreter
-    // path. This standalone Zig binary has no node process, so we resolve the
-    // absolute path of `node` on PATH via `command -v` (the closest analogue).
-    // Falls back to the bare name if resolution fails.
-    const argv = [_][:0]const u8{
-        gpa.dupeZ(u8, "/bin/sh") catch return "node",
-        gpa.dupeZ(u8, "-c") catch return "node",
-        gpa.dupeZ(u8, "command -v node") catch return "node",
-    };
-    if (captureSpawn(gpa, &argv)) |cap| {
-        if (cap.status == 0) {
-            const trimmed = std.mem.trim(u8, cap.stdout, " \t\r\n");
-            if (trimmed.len > 0) return gpa.dupe(u8, trimmed) catch "node";
-        }
-    }
-    return "node";
 }
 
 // ── installMcpShrink ──────────────────────────────────────────────────────────
@@ -1626,10 +1643,15 @@ fn installMcpShrink(ctx: *Ctx) McpResult {
     return .{ .kind = "fail", .why = "claude mcp add failed" };
 }
 
-// ── runInit (dispatch to caveman-init binary, then node script) ───────────────
+// ── runInit (exec the bundled caveman-init Zig binary) ────────────────────────
+// The per-repo rule writer is a native binary (caveman-init). It @embedFile's
+// the rule + skill bodies at build time, so it is fully self-contained — it
+// needs no src/ source tree at runtime. resolveBin finds it in a clone's
+// zig/zig-out/bin or beside caveman-install in the unpacked release archive.
+// (The deleted src/tools/caveman-init.js node path and its remote-fetch
+// fallback are gone — pure-Zig cutover, R6.4.)
 fn runInit(ctx: *Ctx) bool {
     const gpa = ctx.gpa;
-    const io = ctx.io;
     const opts = ctx.opts;
 
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1654,23 +1676,18 @@ fn runInit(ctx: *Ctx) bool {
         return true;
     }
 
-    // Prefer the local src/tools/caveman-init.js (mirror JS). If a clone exists,
-    // run it via node. Otherwise refuse (no detached single-file path).
-    if (ctx.repo_root) |root| {
-        const init_js = std.fs.path.join(gpa, &.{ root, "src/tools/caveman-init.js" }) catch null;
-        if (init_js != null and isFileReal(io, init_js.?)) {
-            var argv: std.ArrayList([]const u8) = .empty;
-            argv.append(gpa, nodePath(gpa)) catch {};
-            argv.append(gpa, init_js.?) catch {};
-            argv.appendSlice(gpa, init_args.items) catch {};
-            const r = runSpawn(gpa, argv.items, opts.dry_run);
-            return r == 0;
-        }
-    }
-    ctx.warn("  local src/tools/caveman-init.js not found; refusing detached single-file --with-init");
-    ctx.warn("  run from a full package/clone so repo-local aliases use the matching init script");
-    ctx.warn(fmt(ctx, "  skipped remote fallback: https://raw.githubusercontent.com/{s}/v1.9.0/src/tools/caveman-init.js", .{REPO}));
-    return false;
+    const init_bin = resolveBin(ctx, "caveman-init") orelse {
+        ctx.warn("  caveman-init binary not found beside caveman-install");
+        ctx.warn("  re-run via install.sh (it ships caveman-init in the release archive)");
+        ctx.warn("  or from a built clone (zig build -Dtool=caveman writes zig/zig-out/bin/caveman-init)");
+        return false;
+    };
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.append(gpa, init_bin) catch {};
+    argv.appendSlice(gpa, init_args.items) catch {};
+    const r = runSpawn(gpa, argv.items, opts.dry_run);
+    return r == 0;
 }
 
 // ── uninstall ─────────────────────────────────────────────────────────────────
@@ -1716,9 +1733,14 @@ fn uninstall(ctx: *Ctx) void {
         }
     }
 
-    // Delete hook files.
+    // Delete hook binaries (and any legacy pre-cutover JS/shell leftovers).
+    const LEGACY_HOOK_FILES = [_][]const u8{
+        "package.json",            "caveman-config.js", "caveman-activate.js",
+        "caveman-mode-tracker.js", "caveman-stats.js",  "caveman-statusline.sh",
+        "caveman-statusline.ps1",
+    };
     if (common.classify(io, hooks_dir) == .dir) {
-        for (HOOK_FILES) |f| {
+        for (HOOK_BINS) |f| {
             const p = std.fs.path.join(gpa, &.{ hooks_dir, f }) catch continue;
             if (!pathExists(io, p)) continue;
             if (!opts.dry_run) {
@@ -1726,6 +1748,15 @@ fn uninstall(ctx: *Ctx) void {
                 if (common.toZ(&b, p)) |z| _ = c.unlink(z) else |_| {}
             }
             ctx.note(fmt(ctx, "  removed {s}", .{p}));
+        }
+        for (LEGACY_HOOK_FILES) |f| {
+            const p = std.fs.path.join(gpa, &.{ hooks_dir, f }) catch continue;
+            if (!pathExists(io, p)) continue;
+            if (!opts.dry_run) {
+                var b: [std.fs.max_path_bytes]u8 = undefined;
+                if (common.toZ(&b, p)) |z| _ = c.unlink(z) else |_| {}
+            }
+            ctx.note(fmt(ctx, "  removed {s} (legacy)", .{p}));
         }
     }
 
@@ -1988,10 +2019,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const io = threaded.io();
 
     var argv: std.ArrayList([]const u8) = .empty;
+    var argv0: []const u8 = "";
     {
         var it = init.args.iterate();
         defer it.deinit();
-        _ = it.skip();
+        if (it.next()) |a0| argv0 = gpa.dupe(u8, a0) catch "";
         while (it.next()) |a| argv.append(gpa, gpa.dupe(u8, a) catch continue) catch {};
     }
 
@@ -2012,6 +2044,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         break :blk std.fs.path.join(gpa, &.{ home, ".claude" }) catch "";
     };
     const repo_root = detectRepoRoot(io, gpa);
+    const self_bin_dir = selfBinDirFromArgv0(io, gpa, argv0);
 
     var results: Results = .{};
     var ctx: Ctx = .{
@@ -2020,6 +2053,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .opts = &opts,
         .config_dir = config_dir,
         .repo_root = repo_root,
+        .self_bin_dir = self_bin_dir,
         .results = &results,
         .color = makeChalk(opts.no_color),
     };
@@ -2072,7 +2106,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (runInit(&ctx)) {
             pushInstalled(&ctx, fmt(&ctx, "caveman-init ({s})", .{cwd}));
         } else {
-            pushFailed(&ctx, "caveman-init", "src/tools/caveman-init.js failed");
+            pushFailed(&ctx, "caveman-init", "caveman-init binary failed");
         }
         out("\n");
     } else if (results.installed.items.len > 0 or results.skipped.items.len > 0) {
