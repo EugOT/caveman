@@ -2,12 +2,18 @@
 from pathlib import Path
 import sys
 
-# Support both direct execution and module import
+# The Python `validate` module was retired in the R6.4 pure-Zig cutover
+# (validation now lives in the `caveman-compress-validate` Zig binary). This
+# dev-only benchmark keeps reporting token counts; the "Valid" column degrades
+# to "unknown" when no Python validator is importable.
 try:
-    from .validate import validate
+    from .validate import validate  # type: ignore[attr-defined]
 except ImportError:
-    sys.path.insert(0, str(Path(__file__).parent))
-    from validate import validate
+    try:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from validate import validate  # type: ignore[no-redef]
+    except ImportError:
+        validate = None  # type: ignore[assignment]
 
 try:
     import tiktoken
@@ -29,16 +35,19 @@ def benchmark_pair(orig_path: Path, comp_path: Path):
     orig_tokens = count_tokens(orig_text)
     comp_tokens = count_tokens(comp_text)
     saved = 100 * (orig_tokens - comp_tokens) / orig_tokens if orig_tokens > 0 else 0.0
-    result = validate(orig_path, comp_path)
+    # `validate` is None when the retired Python validator is unavailable; the
+    # token-accounting numbers are still meaningful, so report validity as None.
+    is_valid = validate(orig_path, comp_path).is_valid if validate is not None else None
 
-    return (comp_path.name, orig_tokens, comp_tokens, saved, result.is_valid)
+    return (comp_path.name, orig_tokens, comp_tokens, saved, is_valid)
 
 
 def print_table(rows):
     print("\n| File | Original | Compressed | Saved % | Valid |")
     print("|------|----------|------------|---------|-------|")
     for r in rows:
-        print(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]:.1f}% | {'✅' if r[4] else '❌'} |")
+        valid = "❓" if r[4] is None else ("✅" if r[4] else "❌")
+        print(f"| {r[0]} | {r[1]} | {r[2]} | {r[3]:.1f}% | {valid} |")
 
 
 def main():
