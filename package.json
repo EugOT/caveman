@@ -12,17 +12,10 @@
   "bugs": {
     "url": "https://github.com/JuliusBrussee/caveman/issues"
   },
-  "bin": {
-    "caveman": "./bin/install.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
   "scripts": {
-    "test": "node --test tests/installer/*.test.mjs"
+    "test": "cd zig && zig build test -Dtool=caveman"
   },
   "files": [
-    "bin/",
     "src/",
     "agents/",
     "skills/",

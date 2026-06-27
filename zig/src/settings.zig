@@ -251,29 +251,101 @@ pub const AddHookOpts = struct {
 pub fn addCommandHook(arena: std.mem.Allocator, settings: *std.json.Value, event: []const u8, opts: AddHookOpts) !bool {
     if (settings.* != .object) return false;
     if (settings.object.get("hooks") == null or settings.object.get("hooks").? != .object) {
-        try settings.object.put(arena, "hooks", .{ .object = .{} });
+        try settings.object.put("hooks", .{ .object = std.json.ObjectMap.init(arena) });
     }
     const hooks_ptr = settings.object.getPtr("hooks").?;
     if (hooks_ptr.object.get(event) == null or hooks_ptr.object.get(event).? != .array) {
-        try hooks_ptr.object.put(arena, event, .{ .array = std.json.Array.init(arena) });
+        try hooks_ptr.object.put(event, .{ .array = std.json.Array.init(arena) });
     }
     const marker = opts.marker orelse opts.command;
     if (hasCavemanHook(settings, event, marker)) return false;
 
-    var hook: std.json.ObjectMap = .{};
-    try hook.put(arena, "type", .{ .string = "command" });
-    try hook.put(arena, "command", .{ .string = opts.command });
-    if (opts.timeout) |t| try hook.put(arena, "timeout", .{ .integer = t });
-    if (opts.status_message) |m| try hook.put(arena, "statusMessage", .{ .string = m });
+    var hook = std.json.ObjectMap.init(arena);
+    try hook.put("type", .{ .string = "command" });
+    try hook.put("command", .{ .string = opts.command });
+    if (opts.timeout) |t| try hook.put("timeout", .{ .integer = t });
+    if (opts.status_message) |m| try hook.put("statusMessage", .{ .string = m });
 
     var inner = std.json.Array.init(arena);
     try inner.append(.{ .object = hook });
-    var wrapper: std.json.ObjectMap = .{};
-    try wrapper.put(arena, "hooks", .{ .array = inner });
+    var wrapper = std.json.ObjectMap.init(arena);
+    try wrapper.put("hooks", .{ .array = inner });
 
     const arr_ptr = hooks_ptr.object.getPtr(event).?;
     try arr_ptr.array.append(.{ .object = wrapper });
     return true;
+}
+
+// ── addCavemanHooks (full standalone-install merge) ────────────────────────
+// Wire the three managed Zig-binary hooks + statusline into `settings`, all
+// idempotent. Mirrors the merge that bin/install.js / install.zig perform, but
+// pointed at the prebuilt Zig binaries (no node, no bash wrapper): the binaries
+// are native executables invoked directly by absolute path.
+//
+//   SessionStart    → "<hooks_dir>/caveman-activate"
+//   UserPromptSubmit→ "<hooks_dir>/caveman-hook"
+//   statusLine      → "<hooks_dir>/caveman-statusline"
+//
+// Returns how the statusline ended up so the caller can report it:
+//   .configured  — we added the caveman statusLine (none was present)
+//   .already     — a caveman statusLine was already present
+//   .skipped     — a non-caveman statusLine exists; left untouched
+pub const StatusLineResult = enum { configured, already, skipped };
+
+pub fn addCavemanHooks(arena: std.mem.Allocator, settings: *std.json.Value, hooks_dir: []const u8) !StatusLineResult {
+    if (settings.* != .object) {
+        settings.* = .{ .object = std.json.ObjectMap.init(arena) };
+    }
+
+    const activate = try std.fs.path.join(arena, &.{ hooks_dir, "caveman-activate" });
+    const hook = try std.fs.path.join(arena, &.{ hooks_dir, "caveman-hook" });
+    const statusline = try std.fs.path.join(arena, &.{ hooks_dir, "caveman-statusline" });
+
+    // The Zig hook binaries are native executables — the settings.json command is
+    // just the quoted absolute path, no interpreter prefix. Marker keys off the
+    // basename so the entry is recognized regardless of how the path was quoted.
+    const activate_cmd = try std.fmt.allocPrint(arena, "\"{s}\"", .{activate});
+    _ = try addCommandHook(arena, settings, "SessionStart", .{
+        .command = activate_cmd,
+        .marker = "caveman-activate",
+        .timeout = 5,
+        .status_message = "Loading caveman mode...",
+    });
+
+    const hook_cmd = try std.fmt.allocPrint(arena, "\"{s}\"", .{hook});
+    _ = try addCommandHook(arena, settings, "UserPromptSubmit", .{
+        .command = hook_cmd,
+        .marker = "caveman-hook",
+        .timeout = 5,
+        .status_message = "Tracking caveman mode...",
+    });
+
+    // statusLine lives outside hooks. Add only if absent; never clobber a
+    // user-defined statusline.
+    const sl_cmd = try std.fmt.allocPrint(arena, "\"{s}\"", .{statusline});
+    var result: StatusLineResult = .skipped;
+    if (settings.object.get("statusLine") == null) {
+        var slo = std.json.ObjectMap.init(arena);
+        try slo.put("type", .{ .string = "command" });
+        try slo.put("command", .{ .string = sl_cmd });
+        try settings.object.put("statusLine", .{ .object = slo });
+        result = .configured;
+    } else {
+        const sl_val = settings.object.get("statusLine").?;
+        const existing = switch (sl_val) {
+            .string => |s| s,
+            .object => |o| if (o.get("command")) |cv| (if (cv == .string) cv.string else "") else "",
+            else => "",
+        };
+        if (std.mem.indexOf(u8, existing, "caveman-statusline") != null) {
+            result = .already;
+        } else {
+            result = .skipped;
+        }
+    }
+
+    try validateHookFields(arena, settings);
+    return result;
 }
 
 // ── removeCavemanHooks ─────────────────────────────────────────────────────
@@ -318,6 +390,25 @@ pub fn removeCavemanHooks(arena: std.mem.Allocator, settings: *std.json.Value, m
     return removed;
 }
 
+// ── removeCavemanStatusLine ────────────────────────────────────────────────
+// Drop a managed statusLine (string or {command}) whose command references
+// "caveman-statusline". Mirrors the statusLine strip install.zig's uninstall
+// performs alongside removeCavemanHooks. Returns true if removed.
+pub fn removeCavemanStatusLine(settings: *std.json.Value) bool {
+    if (settings.* != .object) return false;
+    const sl = settings.object.get("statusLine") orelse return false;
+    const cmd = switch (sl) {
+        .string => |s| s,
+        .object => |o| if (o.get("command")) |cv| (if (cv == .string) cv.string else "") else "",
+        else => "",
+    };
+    if (std.mem.indexOf(u8, cmd, "caveman-statusline") != null) {
+        _ = settings.object.orderedRemove("statusLine");
+        return true;
+    }
+    return false;
+}
+
 // JS keeps an entry whose hooks array is absent/malformed (filter returns true),
 // drops it only when SOME hook command includes the marker.
 fn entryMentionsMarker(entry: std.json.Value, marker: []const u8) bool {
@@ -336,11 +427,17 @@ fn entryMentionsMarker(entry: std.json.Value, marker: []const u8) bool {
 }
 
 pub const MANAGED_HOOK_BASENAMES = [_][]const u8{
+    // Legacy JS/shell hook filenames (pre-R6.3 standalone installs).
     "caveman-activate.js",
     "caveman-mode-tracker.js",
     "caveman-stats.js",
     "caveman-statusline.sh",
     "caveman-statusline.ps1",
+    // R6.3 pure-Zig hook binaries (native executables, no extension).
+    "caveman-activate",
+    "caveman-hook",
+    "caveman-stats",
+    "caveman-statusline",
 };
 
 fn isManagedBasename(name: []const u8) bool {
@@ -431,7 +528,7 @@ fn isWs(ch: u8) bool {
 // ── pruneOrphanedManagedHooks ──────────────────────────────────────────────
 // Drop managed hook entries whose target script is missing on disk. Also drops
 // an orphaned managed statusLine. Returns count removed.
-pub fn pruneOrphanedManagedHooks(arena: std.mem.Allocator, settings: *std.json.Value, config_dir: ?[]const u8) !usize {
+pub fn pruneOrphanedManagedHooks(io: std.Io, arena: std.mem.Allocator, settings: *std.json.Value, config_dir: ?[]const u8) !usize {
     if (settings.* != .object) return 0;
     const base_dir = config_dir orelse try claudeConfigDir(arena);
     var removed: usize = 0;
@@ -457,7 +554,7 @@ pub fn pruneOrphanedManagedHooks(arena: std.mem.Allocator, settings: *std.json.V
                 const before = arr_ptr.array.items.len;
                 var kept: std.json.Array = .init(arena);
                 for (arr_ptr.array.items) |entry| {
-                    if (entryTargetMissing(arena, entry, base_dir)) continue;
+                    if (entryTargetMissing(io, arena, entry, base_dir)) continue;
                     try kept.append(entry);
                 }
                 removed += before - kept.items.len;
@@ -479,7 +576,7 @@ pub fn pruneOrphanedManagedHooks(arena: std.mem.Allocator, settings: *std.json.V
             if (sl.object.get("command")) |cmd| {
                 switch (cmd) {
                     .string => |s| {
-                        if (commandTargetMissing(arena, s, base_dir)) {
+                        if (commandTargetMissing(io, arena, s, base_dir)) {
                             _ = settings.object.orderedRemove("statusLine");
                             removed += 1;
                         }
@@ -495,7 +592,7 @@ pub fn pruneOrphanedManagedHooks(arena: std.mem.Allocator, settings: *std.json.V
 // An entry is dropped iff some hook's command is a managed target that is
 // missing. JS: entry kept (true) when entry malformed; dropped (false from
 // filter perspective → we return true="missing/drop") when some command misses.
-fn entryTargetMissing(arena: std.mem.Allocator, entry: std.json.Value, base_dir: []const u8) bool {
+fn entryTargetMissing(io: std.Io, arena: std.mem.Allocator, entry: std.json.Value, base_dir: []const u8) bool {
     if (entry != .object) return false;
     const inner = entry.object.get("hooks") orelse return false;
     if (inner != .array) return false;
@@ -503,7 +600,7 @@ fn entryTargetMissing(arena: std.mem.Allocator, entry: std.json.Value, base_dir:
         if (h != .object) continue;
         const cmd = h.object.get("command") orelse continue;
         switch (cmd) {
-            .string => |s| if (commandTargetMissing(arena, s, base_dir)) return true,
+            .string => |s| if (commandTargetMissing(io, arena, s, base_dir)) return true,
             else => {},
         }
     }
@@ -513,7 +610,7 @@ fn entryTargetMissing(arena: std.mem.Allocator, entry: std.json.Value, base_dir:
 // Port of targetMissing(command): tokenize honoring quotes; first token whose
 // basename is an exact managed name decides — resolve (abs or under base_dir),
 // return true if absent. No managed token → false.
-fn commandTargetMissing(arena: std.mem.Allocator, command: []const u8, base_dir: []const u8) bool {
+fn commandTargetMissing(io: std.Io, arena: std.mem.Allocator, command: []const u8, base_dir: []const u8) bool {
     var tokens = tokenizeCommand(arena, command) catch return false;
     defer tokens.deinit(arena);
     for (tokens.items) |tok| {
@@ -523,7 +620,7 @@ fn commandTargetMissing(arena: std.mem.Allocator, command: []const u8, base_dir:
             tok
         else
             std.fs.path.join(arena, &.{ base_dir, tok }) catch return false;
-        return !pathExists(script_path);
+        return !pathExists(io, script_path);
     }
     return false;
 }
@@ -576,21 +673,12 @@ fn tokenizeCommand(arena: std.mem.Allocator, command: []const u8) !std.ArrayList
     return out;
 }
 
-// libc stat(2) — not surfaced under this name in std.c for this dev build
-// (matches common.zig's extern lstat decl).
-extern "c" fn stat(path: [*:0]const u8, buf: *c.Stat) c_int;
-
-// libc-backed existence probe (no std.Io). Mirrors fs.existsSync. Uses stat(2)
-// (follows symlinks) so a managed hook target reachable via a symlink still
-// counts as present, matching Node's fs.existsSync.
-fn pathExists(path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len + 1 > buf.len) return false;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    const z: [*:0]const u8 = @ptrCast(buf[0..path.len :0].ptr);
-    var st: c.Stat = undefined;
-    return stat(z, &st) == 0;
+// std.Io existence probe. Mirrors fs.existsSync: statFile FOLLOWING symlinks so a
+// managed hook target reachable via a symlink still counts as present, matching
+// Node's fs.existsSync. std.Io (R6a) so the binary cross-compiles.
+fn pathExists(io: std.Io, path: []const u8) bool {
+    _ = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = true }) catch return false;
+    return true;
 }
 
 // ── claudeConfigDir ────────────────────────────────────────────────────────
@@ -612,7 +700,7 @@ pub const ParseError = error{ ReadFailed, NotJson } || std.mem.Allocator.Error;
 pub fn parseSettings(arena: std.mem.Allocator, raw: []const u8) !std.json.Value {
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     if (trimmed.len == 0) {
-        return .{ .object = .{} };
+        return .{ .object = std.json.ObjectMap.init(arena) };
     }
     if (std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{})) |v| {
         return v;
@@ -639,6 +727,11 @@ pub fn stringifySettings(gpa: std.mem.Allocator, value: std.json.Value) ![]u8 {
 //   caveman-settings prune [configDir]      → parse, pruneOrphanedManagedHooks, print
 //   caveman-settings remove [marker]        → parse, removeCavemanHooks, print
 //   caveman-settings rewrite <absNode>      → parse, rewriteLegacyManagedHookCommands, print
+//   caveman-settings add <hooksDir>         → parse, wire Zig hook binaries +
+//                                             statusline (idempotent), print.
+//                                             statusline state → exit code:
+//                                             0 configured, 0 already, 0 skipped;
+//                                             a one-line note on stderr.
 // For mutating ops the printed JSON is the post-mutation document.
 // 0.16 entry shape: the no-alloc POSIX arg iterator (init, not std.Io) keeps us
 // on the libc C-ABI surface like the rest of the hook tree (stats.zig).
@@ -646,6 +739,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var arena_state = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    // Construct the std.Io backend once; thread it down to the FS-touching prune
+    // path. This module has no common.zig dependency, so construct directly.
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
 
     // Collect argv (after argv0) into a slice so we can index positionally.
     var argv: std.ArrayList([]const u8) = .empty;
@@ -659,7 +758,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     if (argv.items.len < 1) {
-        writeStderr("usage: caveman-settings <strip|validate|prune|remove|rewrite> [arg]\n");
+        writeStderr("usage: caveman-settings <strip|validate|prune|remove|rewrite|add> [arg]\n");
         std.process.exit(2);
     }
     const cmd = argv.items[0];
@@ -681,16 +780,33 @@ pub fn main(init: std.process.Init.Minimal) !void {
         try validateHookFields(arena, &value);
     } else if (std.mem.eql(u8, cmd, "prune")) {
         const dir: ?[]const u8 = if (argv.items.len >= 2) argv.items[1] else null;
-        _ = try pruneOrphanedManagedHooks(arena, &value, dir);
+        _ = try pruneOrphanedManagedHooks(io, arena, &value, dir);
     } else if (std.mem.eql(u8, cmd, "remove")) {
         const marker: []const u8 = if (argv.items.len >= 2) argv.items[1] else "caveman";
         _ = try removeCavemanHooks(arena, &value, marker);
+        // Also drop a managed caveman statusLine — install.zig's uninstall path
+        // strips it alongside the hooks, so the CLI surface must too for the
+        // shell uninstaller to reach full parity.
+        _ = removeCavemanStatusLine(&value);
     } else if (std.mem.eql(u8, cmd, "rewrite")) {
         if (argv.items.len < 2) {
             writeStderr("caveman-settings rewrite requires <absoluteNode>\n");
             std.process.exit(2);
         }
         _ = try rewriteLegacyManagedHookCommands(arena, &value, argv.items[1]);
+    } else if (std.mem.eql(u8, cmd, "add")) {
+        if (argv.items.len < 2) {
+            writeStderr("caveman-settings add requires <hooksDir>\n");
+            std.process.exit(2);
+        }
+        const sl = try addCavemanHooks(arena, &value, argv.items[1]);
+        // Report statusline state on stderr — stdout must stay pure JSON so the
+        // installer can capture it. The shell echoes these to the user.
+        switch (sl) {
+            .configured => writeStderr("  statusline badge configured.\n"),
+            .already => writeStderr("  statusline badge already configured.\n"),
+            .skipped => writeStderr("  note: existing statusline detected — caveman badge NOT added.\n"),
+        }
     } else {
         writeStderr("caveman-settings: unknown command\n");
         std.process.exit(2);
@@ -851,6 +967,52 @@ test "addCommandHook is idempotent on substring marker" {
     try testing.expectEqual(@as(usize, 1), v.object.get("hooks").?.object.get("SessionStart").?.array.items.len);
 }
 
+test "addCavemanHooks wires the three Zig hook binaries + statusline" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = try parse(a, "{}");
+    const sl = try addCavemanHooks(a, &v, "/home/u/.claude/hooks");
+    try testing.expectEqual(StatusLineResult.configured, sl);
+
+    // SessionStart → caveman-activate (quoted absolute path, no interpreter).
+    const ss = v.object.get("hooks").?.object.get("SessionStart").?.array;
+    try testing.expectEqual(@as(usize, 1), ss.items.len);
+    const ss_cmd = ss.items[0].object.get("hooks").?.array.items[0].object.get("command").?.string;
+    try testing.expectEqualStrings("\"/home/u/.claude/hooks/caveman-activate\"", ss_cmd);
+
+    // UserPromptSubmit → caveman-hook.
+    const ups = v.object.get("hooks").?.object.get("UserPromptSubmit").?.array;
+    const ups_cmd = ups.items[0].object.get("hooks").?.array.items[0].object.get("command").?.string;
+    try testing.expectEqualStrings("\"/home/u/.claude/hooks/caveman-hook\"", ups_cmd);
+
+    // statusLine → caveman-statusline.
+    const slc = v.object.get("statusLine").?.object.get("command").?.string;
+    try testing.expectEqualStrings("\"/home/u/.claude/hooks/caveman-statusline\"", slc);
+}
+
+test "addCavemanHooks is idempotent (re-add adds nothing)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = try parse(a, "{}");
+    _ = try addCavemanHooks(a, &v, "/h");
+    const sl2 = try addCavemanHooks(a, &v, "/h");
+    try testing.expectEqual(StatusLineResult.already, sl2);
+    try testing.expectEqual(@as(usize, 1), v.object.get("hooks").?.object.get("SessionStart").?.array.items.len);
+    try testing.expectEqual(@as(usize, 1), v.object.get("hooks").?.object.get("UserPromptSubmit").?.array.items.len);
+}
+
+test "addCavemanHooks never clobbers a non-caveman statusLine" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = try parse(a, "{\"statusLine\":{\"type\":\"command\",\"command\":\"my-prompt.sh\"}}");
+    const sl = try addCavemanHooks(a, &v, "/h");
+    try testing.expectEqual(StatusLineResult.skipped, sl);
+    try testing.expectEqualStrings("my-prompt.sh", v.object.get("statusLine").?.object.get("command").?.string);
+}
+
 test "hasCavemanHook detects via substring" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -886,6 +1048,23 @@ test "removeCavemanHooks strips by marker and cleans empties" {
     try testing.expect(v.object.get("hooks").?.object.get("UserPromptSubmit") == null);
 }
 
+test "removeCavemanStatusLine drops managed statusLine, keeps user one" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Managed (Zig binary path) → removed.
+    var v1 = try parse(a, "{\"statusLine\":{\"type\":\"command\",\"command\":\"\\\"/h/caveman-statusline\\\"\"}}");
+    try testing.expect(removeCavemanStatusLine(&v1));
+    try testing.expect(v1.object.get("statusLine") == null);
+    // Legacy shell path → also removed (substring match).
+    var v2 = try parse(a, "{\"statusLine\":{\"type\":\"command\",\"command\":\"bash /h/caveman-statusline.sh\"}}");
+    try testing.expect(removeCavemanStatusLine(&v2));
+    // User statusline → preserved.
+    var v3 = try parse(a, "{\"statusLine\":{\"type\":\"command\",\"command\":\"my-prompt.sh\"}}");
+    try testing.expect(!removeCavemanStatusLine(&v3));
+    try testing.expect(v3.object.get("statusLine") != null);
+}
+
 test "rewriteLegacyManagedHookCommands rewrites bare-node managed scripts" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -918,7 +1097,10 @@ test "pruneOrphanedManagedHooks removes missing absolute-node managed hook" {
     var v = try parse(a,
         \\{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"\"/opt/node/bin/node\" \"/no/such/dir/caveman-activate.js\""}]}]}}
     );
-    const removed = try pruneOrphanedManagedHooks(a, &v, "/tmp/__cm_cfg_missing");
+    var th_io: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer th_io.deinit();
+    const io = th_io.io();
+    const removed = try pruneOrphanedManagedHooks(io, a, &v, "/tmp/__cm_cfg_missing");
     try testing.expectEqual(@as(usize, 1), removed);
     try testing.expect(v.object.get("hooks") == null);
 }
@@ -930,7 +1112,10 @@ test "pruneOrphanedManagedHooks removes orphan bare-node managed hook" {
     var v = try parse(a,
         \\{"hooks":{"UserPromptSubmit":[{"hooks":[{"type":"command","command":"node /no/such/dir/caveman-mode-tracker.js"}]}]}}
     );
-    const removed = try pruneOrphanedManagedHooks(a, &v, "/tmp/__cm_cfg_missing");
+    var th_io: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer th_io.deinit();
+    const io = th_io.io();
+    const removed = try pruneOrphanedManagedHooks(io, a, &v, "/tmp/__cm_cfg_missing");
     try testing.expectEqual(@as(usize, 1), removed);
     try testing.expect(v.object.get("hooks") == null);
 }
@@ -940,33 +1125,32 @@ test "pruneOrphanedManagedHooks keeps managed hook whose target exists" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Create the script so its target exists.
+    var th_io: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer th_io.deinit();
+    const io = th_io.io();
+
+    // Create the script so its target exists. Build the fixture through std.Io
+    // (Dir.createDir / Dir.createFile + writePositionalAll) — the same portable
+    // surface the code under test uses — instead of raw libc mkdir/open/write.
     const base = std.c.getenv("TMPDIR");
     const base_dir = if (base) |p| std.mem.sliceTo(p, 0) else "/tmp";
     const dir = try std.fmt.allocPrint(a, "{s}/cm-prune-zig.{d}", .{ base_dir, c.getpid() });
-    {
-        var db: [std.fs.max_path_bytes]u8 = undefined;
-        @memcpy(db[0..dir.len], dir);
-        db[dir.len] = 0;
-        _ = c.mkdir(@ptrCast(db[0..dir.len :0].ptr), 0o700);
-    }
+    std.Io.Dir.cwd().createDir(io, dir, .fromMode(0o700)) catch {};
     const script = try std.fs.path.join(a, &.{ dir, "caveman-activate.js" });
     {
-        var sb: [std.fs.max_path_bytes]u8 = undefined;
-        @memcpy(sb[0..script.len], script);
-        sb[script.len] = 0;
-        const fd = c.open(@ptrCast(sb[0..script.len :0].ptr), .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(c.mode_t, 0o600));
-        if (fd >= 0) {
-            _ = c.write(fd, "x", 1);
-            _ = c.close(fd);
-        }
+        std.Io.Dir.cwd().deleteFile(io, script) catch {};
+        if (std.Io.Dir.cwd().createFile(io, script, .{ .exclusive = true, .permissions = .fromMode(0o600) })) |f_const| {
+            var f = f_const;
+            defer f.close(io);
+            f.writePositionalAll(io, "x", 0) catch {};
+        } else |_| {}
     }
 
     const json = try std.fmt.allocPrint(a,
         \\{{"hooks":{{"SessionStart":[{{"hooks":[{{"type":"command","command":"\"/opt/node/bin/node\" \"{s}\""}}]}}]}}}}
     , .{script});
     var v = try parse(a, json);
-    const removed = try pruneOrphanedManagedHooks(a, &v, dir);
+    const removed = try pruneOrphanedManagedHooks(io, a, &v, dir);
     try testing.expectEqual(@as(usize, 0), removed);
     try testing.expectEqual(@as(usize, 1), v.object.get("hooks").?.object.get("SessionStart").?.array.items.len);
 }
@@ -978,7 +1162,10 @@ test "pruneOrphanedManagedHooks leaves non-managed hooks alone even if missing" 
     var v = try parse(a,
         \\{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node /no/such/dir/some-user-hook.js"},{"type":"command","command":"[ -n \"$SUPERSET_HOME_DIR\" ] && \"$SUPERSET_HOME_DIR/hooks/notify.sh\" || true"}]}]}}
     );
-    const removed = try pruneOrphanedManagedHooks(a, &v, "/tmp/__cm_cfg_missing");
+    var th_io: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer th_io.deinit();
+    const io = th_io.io();
+    const removed = try pruneOrphanedManagedHooks(io, a, &v, "/tmp/__cm_cfg_missing");
     try testing.expectEqual(@as(usize, 0), removed);
     try testing.expectEqual(@as(usize, 2), v.object.get("hooks").?.object.get("SessionStart").?.array.items[0].object.get("hooks").?.array.items.len);
 }
@@ -990,7 +1177,10 @@ test "pruneOrphanedManagedHooks resolves relative target against configDir" {
     var v = try parse(a,
         \\{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node hooks/caveman-activate.js"}]}]}}
     );
-    const removed = try pruneOrphanedManagedHooks(a, &v, "/tmp/__cm_cfg_rel_missing");
+    var th_io: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer th_io.deinit();
+    const io = th_io.io();
+    const removed = try pruneOrphanedManagedHooks(io, a, &v, "/tmp/__cm_cfg_rel_missing");
     try testing.expectEqual(@as(usize, 1), removed);
     try testing.expect(v.object.get("hooks") == null);
 }
@@ -1002,7 +1192,10 @@ test "pruneOrphanedManagedHooks does NOT match user script merely containing man
     var v = try parse(a,
         \\{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node /no/such/dir/mycaveman-activate.js"}]}]}}
     );
-    const removed = try pruneOrphanedManagedHooks(a, &v, "/tmp/__cm_cfg_missing");
+    var th_io: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer th_io.deinit();
+    const io = th_io.io();
+    const removed = try pruneOrphanedManagedHooks(io, a, &v, "/tmp/__cm_cfg_missing");
     try testing.expectEqual(@as(usize, 0), removed);
     try testing.expectEqual(@as(usize, 1), v.object.get("hooks").?.object.get("SessionStart").?.array.items[0].object.get("hooks").?.array.items.len);
 }
@@ -1014,7 +1207,10 @@ test "pruneOrphanedManagedHooks handles quoted paths containing spaces" {
     var v = try parse(a,
         \\{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"\"/opt/node/bin/node\" \"/no such dir/caveman-activate.js\""}]}]}}
     );
-    const removed = try pruneOrphanedManagedHooks(a, &v, "/tmp/__cm_cfg_missing");
+    var th_io: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer th_io.deinit();
+    const io = th_io.io();
+    const removed = try pruneOrphanedManagedHooks(io, a, &v, "/tmp/__cm_cfg_missing");
     try testing.expectEqual(@as(usize, 1), removed);
     try testing.expect(v.object.get("hooks") == null);
 }
@@ -1026,7 +1222,10 @@ test "pruneOrphanedManagedHooks drops orphaned managed statusLine" {
     var v = try parse(a,
         \\{"statusLine":{"type":"command","command":"bash /no/such/dir/caveman-statusline.sh"}}
     );
-    const removed = try pruneOrphanedManagedHooks(a, &v, "/tmp/__cm_cfg_missing");
+    var th_io: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer th_io.deinit();
+    const io = th_io.io();
+    const removed = try pruneOrphanedManagedHooks(io, a, &v, "/tmp/__cm_cfg_missing");
     try testing.expectEqual(@as(usize, 1), removed);
     try testing.expect(v.object.get("statusLine") == null);
 }
@@ -1038,7 +1237,10 @@ test "pruneOrphanedManagedHooks drops orphaned managed PowerShell statusLine" {
     var v = try parse(a,
         \\{"statusLine":{"type":"command","command":"powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"/no/such/dir/caveman-statusline.ps1\""}}
     );
-    const removed = try pruneOrphanedManagedHooks(a, &v, "/tmp/__cm_cfg_missing");
+    var th_io: std.Io.Threaded = .init(std.heap.page_allocator, .{});
+    defer th_io.deinit();
+    const io = th_io.io();
+    const removed = try pruneOrphanedManagedHooks(io, a, &v, "/tmp/__cm_cfg_missing");
     try testing.expectEqual(@as(usize, 1), removed);
     try testing.expect(v.object.get("statusLine") == null);
 }

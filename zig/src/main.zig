@@ -19,6 +19,14 @@ const std = @import("std");
 const common = @import("common.zig");
 
 const TOOL = common.TOOL; // "caveman" or "ponytail"
+// Uppercased tool name for the per-turn reinforcement text ("CAVEMAN MODE
+// ACTIVE (...)"), computed at comptime since TOOL is comptime-known.
+const TOOL_UPPER = blk: {
+    var buf: [TOOL.len]u8 = undefined;
+    for (TOOL, 0..) |ch, i| buf[i] = std.ascii.toUpper(ch);
+    const final = buf;
+    break :blk &final;
+};
 
 const canonicalMode = common.canonicalMode;
 const isIndependentMode = common.isIndependentMode;
@@ -29,21 +37,117 @@ const unlinkFlag = common.unlinkFlag;
 const readStdin = common.readStdin;
 const writeStdout = common.writeStdout;
 
-/// Extract the "prompt" string from the hook JSON via std.json (correct, not
-/// hand-rolled). Returns an owned copy or null.
-fn extractPrompt(gpa: std.mem.Allocator, input: []const u8) ?[]u8 {
+/// Extract a top-level string field from the hook JSON. Returns an owned copy
+/// or null. Used for both "prompt" and "transcript_path".
+fn extractStringField(gpa: std.mem.Allocator, input: []const u8, field: []const u8) ?[]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, input, .{}) catch return null;
     defer parsed.deinit();
     const obj = switch (parsed.value) {
         .object => |o| o,
         else => return null,
     };
-    const p = obj.get("prompt") orelse return null;
-    const s = switch (p) {
+    const v = obj.get(field) orelse return null;
+    const s = switch (v) {
         .string => |str| str,
         else => return null,
     };
     return gpa.dupe(u8, s) catch null;
+}
+
+fn extractPrompt(gpa: std.mem.Allocator, input: []const u8) ?[]u8 {
+    return extractStringField(gpa, input, "prompt");
+}
+
+/// Spawn a child, capture its stdout into an owned buffer, discard stderr.
+/// Stdlib-first: std.process.run (gpa, io) PATH-resolves argv[0] from the parent
+/// environment (same as the old execvp), opens /dev/null for the child's stdin
+/// via `stdin = .ignore`, pipes+collects stdout and stderr, then waits/reaps the
+/// child. We keep result.stdout and free result.stderr — behavior-identical to
+/// the old fork+pipe+dup2 version that captured stdout and routed stderr to
+/// /dev/null. Returns the captured stdout (owned) or null on any spawn/IO error.
+fn captureStdout(gpa: std.mem.Allocator, io: std.Io, argv: []const []const u8) ?[]u8 {
+    if (argv.len == 0) return null;
+    const result = std.process.run(gpa, io, .{ .argv = argv }) catch return null;
+    gpa.free(result.stderr); // discarded, as the old child redirected stderr → /dev/null
+    return result.stdout;
+}
+
+/// Append `s` to `out` as a JSON-escaped string body (between quotes).
+fn appendJsonString(gpa: std.mem.Allocator, out: *std.ArrayList(u8), s: []const u8) !void {
+    for (s) |ch| switch (ch) {
+        '"' => try out.appendSlice(gpa, "\\\""),
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        '\n' => try out.appendSlice(gpa, "\\n"),
+        '\r' => try out.appendSlice(gpa, "\\r"),
+        '\t' => try out.appendSlice(gpa, "\\t"),
+        else => if (ch < 0x20) {
+            try out.appendSlice(gpa, "\\u00");
+            const hex = "0123456789abcdef";
+            try out.append(gpa, hex[(ch >> 4) & 0xf]);
+            try out.append(gpa, hex[ch & 0xf]);
+        } else try out.append(gpa, ch),
+    };
+}
+
+/// /caveman-stats handler: detect the slash command, run the caveman-stats
+/// binary (PATH-resolved) with --session-file <transcript_path> and passthrough
+/// flags, and emit {"decision":"block","reason":<stats output>}. Mirrors
+/// caveman-mode-tracker.js lines 41-62. Returns true if handled (caller exits).
+fn handleStats(gpa: std.mem.Allocator, io: std.Io, prompt: []const u8, input: []const u8) bool {
+    const trimmed = std.mem.trim(u8, prompt, " \t\r\n");
+    const a = "/" ++ TOOL ++ "-stats";
+    const b = "/" ++ TOOL ++ ":" ++ TOOL ++ "-stats";
+    // First token must be exactly the stats command (allow trailing args).
+    var it = std.mem.tokenizeAny(u8, trimmed, " \t");
+    const first = it.next() orelse return false;
+    if (!std.ascii.eqlIgnoreCase(first, a) and !std.ascii.eqlIgnoreCase(first, b)) return false;
+
+    // Build argv: caveman-stats [--session-file <path>] [--share] [--all] [--since <v>].
+    // std.process.run takes plain []const u8 (it PATH-resolves argv[0] itself), so
+    // the args no longer need NUL-termination. We still dupe each element so the
+    // owned slices outlive the parsed tokens / extracted transcript_path.
+    var args: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (args.items) |arg| gpa.free(arg);
+        args.deinit(gpa);
+    }
+    args.append(gpa, gpa.dupe(u8, TOOL ++ "-stats") catch return blockReason(gpa, statsErr())) catch return blockReason(gpa, statsErr());
+
+    if (extractStringField(gpa, input, "transcript_path")) |tp| {
+        defer gpa.free(tp);
+        args.append(gpa, gpa.dupe(u8, "--session-file") catch return blockReason(gpa, statsErr())) catch {};
+        args.append(gpa, gpa.dupe(u8, tp) catch return blockReason(gpa, statsErr())) catch {};
+    }
+    // Passthrough flags from the remaining tokens.
+    while (it.next()) |tok| {
+        if (std.mem.eql(u8, tok, "--share") or std.mem.eql(u8, tok, "--all")) {
+            args.append(gpa, gpa.dupe(u8, tok) catch continue) catch {};
+        } else if (std.mem.eql(u8, tok, "--since")) {
+            if (it.next()) |val| {
+                args.append(gpa, gpa.dupe(u8, "--since") catch continue) catch {};
+                args.append(gpa, gpa.dupe(u8, val) catch continue) catch {};
+            }
+        }
+    }
+
+    const out = captureStdout(gpa, io, args.items) orelse return blockReason(gpa, statsErr());
+    defer gpa.free(out);
+    return blockReason(gpa, std.mem.trim(u8, out, " \t\r\n"));
+}
+
+fn statsErr() []const u8 {
+    return TOOL ++ "-stats: could not run stats binary.";
+}
+
+/// Emit {"decision":"block","reason":<reason>} and return true.
+fn blockReason(gpa: std.mem.Allocator, reason: []const u8) bool {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    out.appendSlice(gpa, "{\"decision\":\"block\",\"reason\":\"") catch return true;
+    appendJsonString(gpa, &out, reason) catch return true;
+    out.appendSlice(gpa, "\"}") catch return true;
+    writeStdout(out.items);
+    return true;
 }
 
 const ModeChange = union(enum) {
@@ -88,15 +192,15 @@ fn anyPairOrdered(prompt: []const u8, firsts: []const []const u8, seconds: []con
 fn parseDeactivation(prompt: []const u8) bool {
     const verbs = &.{ "stop", "disable", "deactivate", "turn off" };
     return containsAny(prompt, &.{"normal mode"}) or
-        anyOrdered(prompt, verbs, "caveman") or
-        anyPairOrdered(prompt, &.{"caveman"}, verbs);
+        anyOrdered(prompt, verbs, TOOL) or
+        anyPairOrdered(prompt, &.{TOOL}, verbs);
 }
 
 fn parseNaturalActivation(prompt: []const u8, default_mode: []const u8) ?ModeChange {
-    const before_caveman = &.{ "activate", "enable", "turn on", "start", "talk like" };
-    const after_caveman = &.{ "mode", "activate", "enable", "turn on", "start" };
-    if (anyOrdered(prompt, before_caveman, "caveman") or
-        anyPairOrdered(prompt, &.{"caveman"}, after_caveman) or
+    const before_tool = &.{ "activate", "enable", "turn on", "start", "talk like" };
+    const after_tool = &.{ "mode", "activate", "enable", "turn on", "start" };
+    if (anyOrdered(prompt, before_tool, TOOL) or
+        anyPairOrdered(prompt, &.{TOOL}, after_tool) or
         containsAny(prompt, &.{ "less tokens", "fewer tokens", "be brief", "be terse", "shorter answers" }))
     {
         if (std.mem.eql(u8, default_mode, "off")) return null;
@@ -140,9 +244,25 @@ fn parseSlashMode(prompt: []const u8, default_mode: []const u8) ?ModeChange {
 }
 
 fn parseModeChange(prompt: []const u8, default_mode: []const u8) ?ModeChange {
-    if (parseDeactivation(prompt)) return .deactivate;
     if (parseSlashMode(prompt, default_mode)) |change| return change;
+    if (parseDeactivation(prompt)) return .deactivate;
     return parseNaturalActivation(prompt, default_mode);
+}
+
+/// Build the OS environment block for the std.Io backend. The hook spawns the
+/// stats binary via std.process.run, which PATH-resolves argv[0] from THIS
+/// block — so it must carry the inherited process environment (PATH), exactly
+/// as the old execvp did. We legacy-`pub fn main()`, so Juicy Main's wiring of
+/// std.os.environ into the global Threaded never ran; we replicate it here.
+///   - POSIX: slice over the libc `environ` global (these hooks link libc).
+///   - Windows: the PEB-backed `.global` block (no envp pointer to slice).
+fn osEnvironBlock() std.process.Environ.Block {
+    if (@import("builtin").os.tag == .windows) return .global;
+    const c_environ = std.c.environ; // [*:null]?[*:0]u8
+    var len: usize = 0;
+    while (c_environ[len] != null) : (len += 1) {}
+    const slice: [:null]const ?[*:0]const u8 = @ptrCast(c_environ[0..len :null]);
+    return .{ .slice = slice };
 }
 
 pub fn main() !void {
@@ -150,38 +270,62 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
+    // Construct the std.Io backend once; thread it down to every FS fn (and to
+    // std.process.run for the stats spawn). Built directly (not via
+    // common.threaded()) so it carries the inherited environment — run's PATH
+    // resolution of argv[0] reads this block, mirroring the old execvp.
+    var threaded: std.Io.Threaded = .init(std.heap.page_allocator, .{ .environ = .{ .block = osEnvironBlock() } });
+    defer threaded.deinit();
+    const io = threaded.io();
+
     const input = readStdin(gpa) catch return; // silent-fail contract
     defer gpa.free(input);
 
     const prompt = extractPrompt(gpa, input) orelse return;
     defer gpa.free(prompt);
 
-    const default_mode = getDefaultMode(gpa);
-    const change = parseModeChange(prompt, default_mode) orelse return;
+    // /caveman-stats: block the prompt + inject stats output. Checked first,
+    // mirroring caveman-mode-tracker.js (the stats handler runs before any
+    // mode-change / reinforcement logic). Returns true if it handled the prompt.
+    if (handleStats(gpa, io, prompt, input)) return;
+
+    const default_mode = getDefaultMode(io, gpa);
 
     // Silent-fail if env is missing/invalid (e.g. no HOME) — a hook must never
     // bubble an error out of main and disturb prompt submission.
     const path = flagPath(gpa) catch return;
     defer gpa.free(path);
 
-    const mode = switch (change) {
-        .deactivate => {
-            unlinkFlag(path);
-            return;
-        },
-        .activate => |mode| mode,
-    };
+    // 1. Apply a mode change (slash / natural language), if any. This may write
+    //    or clear the flag. An ordinary prompt makes parseModeChange null — we
+    //    DO NOT return here: per-turn reinforcement below still runs so caveman
+    //    stays in the model's attention every turn (mirrors caveman-mode-tracker.js).
+    if (parseModeChange(prompt, default_mode)) |change| {
+        switch (change) {
+            .deactivate => {
+                unlinkFlag(io, path);
+                return; // deactivation: nothing to reinforce
+            },
+            .activate => |mode| safeWriteFlag(io, gpa, path, mode) catch {}, // silent-fail on FS errors
+        }
+    }
 
-    safeWriteFlag(gpa, path, mode) catch return; // silent-fail on FS errors
-    if (isIndependentMode(mode)) return;
+    // 2. Per-turn reinforcement: read the active flag (symlink-safe, whitelist)
+    //    and emit the structured reminder on EVERY turn while caveman is active,
+    //    skipping independent modes (commit/review/compress). Byte-for-text match
+    //    with the JS hook so other plugins' competing style instructions don't
+    //    drown caveman out mid-conversation.
+    // readFlagMode returns a borrowed slice into VALID_MODES rodata — do NOT free.
+    const active = common.readFlagMode(io, gpa, path) orelse return;
+    if (isIndependentMode(active)) return;
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try out.appendSlice(gpa, "{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"");
-    try out.appendSlice(gpa, TOOL);
-    try out.appendSlice(gpa, " mode active: ");
-    try out.appendSlice(gpa, mode);
-    try out.appendSlice(gpa, "\"}}");
+    try out.appendSlice(gpa, TOOL_UPPER);
+    try out.appendSlice(gpa, " MODE ACTIVE (");
+    try out.appendSlice(gpa, active);
+    try out.appendSlice(gpa, "). Drop articles/filler/pleasantries/hedging. Fragments OK. Code/commits/security: write normal.\"}}");
     writeStdout(out.items);
 }
 
@@ -241,12 +385,21 @@ test "parseModeChange is case-insensitive" {
 }
 
 test "parseModeChange natural language toggles" {
-    try expectActivate("lite", "please talk like caveman now", "lite");
+    const activate_phrase = if (std.mem.eql(u8, TOOL, "caveman")) "please talk like caveman now" else "please talk like ponytail now";
+    const stop_phrase = if (std.mem.eql(u8, TOOL, "caveman")) "turn off caveman" else "turn off ponytail";
+    const stop_talking_phrase = if (std.mem.eql(u8, TOOL, "caveman")) "stop talking like caveman" else "stop talking like ponytail";
+    const off_phrase = if (std.mem.eql(u8, TOOL, "caveman")) "activate caveman" else "activate ponytail";
+    try expectActivate("lite", activate_phrase, "lite");
     try expectActivate("ultra", "LESS TOKENS please", "ultra");
     try expectDeactivate("normal mode", "full");
-    try expectDeactivate("turn off caveman", "full");
-    try expectDeactivate("stop talking like caveman", "full");
-    try std.testing.expect(parseModeChange("activate caveman", "off") == null);
+    try expectDeactivate(stop_phrase, "full");
+    try expectDeactivate(stop_talking_phrase, "full");
+    try std.testing.expect(parseModeChange(off_phrase, "off") == null);
+}
+
+test "parseModeChange parses slash commands before natural deactivation" {
+    const prompt = "/" ++ TOOL ++ " ultra then stop " ++ TOOL;
+    try expectActivate("ultra", prompt, "full");
 }
 
 test "extractPrompt pulls prompt field" {

@@ -129,7 +129,7 @@ pub fn humanizeTokens(gpa: std.mem.Allocator, n: f64) ![]u8 {
 /// integers). Negative values keep the sign; grouping applies to the magnitude.
 pub fn grouped(gpa: std.mem.Allocator, value: i64) ![]u8 {
     var tmp: [24]u8 = undefined;
-    const mag: u64 = @intCast(if (value < 0) -value else value);
+    const mag: u64 = absMagnitude(value);
     const digits = std.fmt.bufPrint(&tmp, "{d}", .{mag}) catch unreachable;
 
     var out: std.ArrayList(u8) = .empty;
@@ -141,6 +141,12 @@ pub fn grouped(gpa: std.mem.Allocator, value: i64) ![]u8 {
         try out.append(gpa, ch);
     }
     return out.toOwnedSlice(gpa);
+}
+
+fn absMagnitude(value: i64) u64 {
+    if (value >= 0) return @intCast(value);
+    const plus_one = value + 1;
+    return @as(u64, @intCast(-plus_one)) + 1;
 }
 
 /// One parsed session snapshot — the four fields the JS parseSession returns.
@@ -159,9 +165,23 @@ pub const Session = struct {
 fn asInt(v: std.json.Value) i64 {
     return switch (v) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| floatToI64(f),
         else => 0,
     };
+}
+
+fn floatToI64(f: f64) i64 {
+    if (!std.math.isFinite(f)) return 0;
+    const rounded = @round(f);
+    const max_f: f64 = @floatFromInt(std.math.maxInt(i64));
+    const min_f: f64 = @floatFromInt(std.math.minInt(i64));
+    if (rounded >= max_f) return std.math.maxInt(i64);
+    if (rounded <= min_f) return std.math.minInt(i64);
+    return @intFromFloat(rounded);
+}
+
+fn addClamped(acc: *i64, delta: i64) void {
+    acc.* = std.math.add(i64, acc.*, delta) catch if (delta >= 0) std.math.maxInt(i64) else std.math.minInt(i64);
 }
 
 /// Parse the session JSONL line-by-line, tolerating malformed lines (exactly
@@ -196,9 +216,9 @@ pub fn parseSession(gpa: std.mem.Allocator, raw: []const u8) Session {
             .object => |o| o,
             else => continue,
         };
-        if (uobj.get("output_tokens")) |v| s.output_tokens += asInt(v);
-        if (uobj.get("cache_read_input_tokens")) |v| s.cache_read_tokens += asInt(v);
-        s.turns += 1;
+        if (uobj.get("output_tokens")) |v| addClamped(&s.output_tokens, asInt(v));
+        if (uobj.get("cache_read_input_tokens")) |v| addClamped(&s.cache_read_tokens, asInt(v));
+        addClamped(&s.turns, 1);
         if (s.model == null) {
             if (mobj.get("model")) |mv| switch (mv) {
                 .string => |ms| s.model = gpa.dupe(u8, ms) catch null,
@@ -350,7 +370,7 @@ pub fn aggregateSavedTokens(gpa: std.mem.Allocator, history_raw: []const u8) i64
 
     var total: i64 = 0;
     var vit = latest.valueIterator();
-    while (vit.next()) |v| total += v.saved;
+    while (vit.next()) |v| addClamped(&total, v.saved);
     return total;
 }
 
@@ -412,6 +432,7 @@ fn snapshotLine(
 /// re-aggregate latest-per-session saved tokens, and write the pre-rendered
 /// suffix string ("⛏  <humanized>" or empty) through safeWriteFlag. Best-effort.
 pub fn refreshSuffix(
+    io: std.Io,
     gpa: std.mem.Allocator,
     session_id: []const u8,
     mode: ?[]const u8,
@@ -423,9 +444,9 @@ pub fn refreshSuffix(
 
     const line = snapshotLine(gpa, session_id, mode, session.model, session.output_tokens, sav) catch return;
     defer gpa.free(line);
-    common.appendHistory(hpath, line);
+    common.appendHistory(io, hpath, line);
 
-    const raw = common.readHistoryFile(gpa, hpath) orelse "";
+    const raw = common.readHistoryFile(io, gpa, hpath) orelse "";
     const owned = raw.len > 0;
     defer if (owned) gpa.free(raw);
     const total = aggregateSavedTokens(gpa, raw);
@@ -439,9 +460,9 @@ pub fn refreshSuffix(
         // JS: `⛏  ${human}` — pickaxe + TWO spaces + humanized value.
         const suffix = std.fmt.allocPrint(gpa, "⛏  {s}", .{human}) catch return;
         defer gpa.free(suffix);
-        common.safeWriteFlag(gpa, spath, suffix) catch return;
+        common.safeWriteFlag(io, gpa, spath, suffix) catch return;
     } else {
-        common.safeWriteFlag(gpa, spath, "") catch return;
+        common.safeWriteFlag(io, gpa, spath, "") catch return;
     }
 }
 
@@ -465,13 +486,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
+    // Construct the std.Io backend once; thread it down to every FS fn.
+    var threaded = common.threaded();
+    defer threaded.deinit();
+    const io = threaded.io();
+
     const session_file = sessionFileArg(init.args) orelse {
         common.writeStderr(TOOL ++ "-stats: no Claude Code session found.\n");
         std.process.exit(1);
     };
 
     // Read the session JSONL (best-effort; missing file → empty session block).
-    const raw = common.readHistoryFile(gpa, session_file) orelse "";
+    const raw = common.readHistoryFile(io, gpa, session_file) orelse "";
     const raw_owned = raw.len > 0;
     defer if (raw_owned) gpa.free(raw);
 
@@ -480,12 +506,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const flagp = common.flagPath(gpa) catch null;
     defer if (flagp) |p| gpa.free(p);
-    const mode: ?[]const u8 = if (flagp) |p| common.readFlagMode(gpa, p) else null;
+    const mode: ?[]const u8 = if (flagp) |p| common.readFlagMode(io, gpa, p) else null;
 
     if (session.turns > 0) {
         const sav = deriveSavings(session.output_tokens, mode, session.model);
         const session_id = sessionIdFromPath(session_file);
-        refreshSuffix(gpa, session_id, mode, session, sav);
+        refreshSuffix(io, gpa, session_id, mode, session, sav);
     }
 
     const block = try formatStats(gpa, session, mode, session_file);
@@ -566,6 +592,7 @@ test "grouped thousands separators" {
         .{ .in = 1021, .want = "1,021" },
         .{ .in = 1234567, .want = "1,234,567" },
         .{ .in = -4000, .want = "-4,000" },
+        .{ .in = std.math.minInt(i64), .want = "-9,223,372,036,854,775,808" },
     };
     for (cases) |ca| {
         const got = try grouped(gpa, ca.in);
@@ -592,6 +619,19 @@ test "parseSession sums tokens over fixture JSONL, captures first model" {
     try std.testing.expectEqual(@as(i64, 4000), s.cache_read_tokens); // 2000+1500+0+500
     try std.testing.expectEqual(@as(i64, 4), s.turns);
     try std.testing.expectEqualStrings("claude-opus-4-20250514", s.model.?); // first wins
+}
+
+test "parseSession clamps overflowing token counters" {
+    const gpa = std.testing.allocator;
+    const max = "9223372036854775807";
+    const fixture =
+        "{\"type\":\"assistant\",\"message\":{\"usage\":{\"output_tokens\":" ++ max ++ ",\"cache_read_input_tokens\":" ++ max ++ "}}}\n" ++
+        "{\"type\":\"assistant\",\"message\":{\"usage\":{\"output_tokens\":1,\"cache_read_input_tokens\":1}}}\n";
+    var s = parseSession(gpa, fixture);
+    defer s.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), s.output_tokens);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), s.cache_read_tokens);
+    try std.testing.expectEqual(@as(i64, 2), s.turns);
 }
 
 test "deriveSavings math (full mode, opus legacy price)" {
@@ -687,9 +727,20 @@ test "aggregateSavedTokens keeps latest per session_id" {
     try std.testing.expectEqual(@as(i64, 0), aggregateSavedTokens(gpa, ""));
 }
 
-test "refreshSuffix writes ⛏ + humanized lifetime savings" {
+test "aggregateSavedTokens clamps overflowing totals" {
     const gpa = std.testing.allocator;
-    const dir = try common.makeTmpDir(gpa);
+    const hist =
+        "{\"ts\":1,\"session_id\":\"a\",\"est_saved_tokens\":9223372036854775807}\n" ++
+        "{\"ts\":1,\"session_id\":\"b\",\"est_saved_tokens\":1}\n";
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), aggregateSavedTokens(gpa, hist));
+}
+
+test "refreshSuffix writes ⛏ + humanized lifetime savings" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
+    const gpa = std.testing.allocator;
+    const dir = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir);
 
     // Point CLAUDE_CONFIG_DIR at a fresh temp dir so history/suffix land there.
@@ -698,7 +749,7 @@ test "refreshSuffix writes ⛏ + humanized lifetime savings" {
     defer common.restoreEnv("CLAUDE_CONFIG_DIR", old);
     const cfg = try std.fs.path.join(gpa, &.{ dir, "cfg" });
     defer gpa.free(cfg);
-    try common.mkdirPath(cfg);
+    try common.mkdirPath(io, cfg);
     const cfg_z = try gpa.dupeZ(u8, cfg);
     defer gpa.free(cfg_z);
     _ = common.setenv("CLAUDE_CONFIG_DIR", cfg_z.ptr, 1);
@@ -708,11 +759,11 @@ test "refreshSuffix writes ⛏ + humanized lifetime savings" {
     defer s.deinit(gpa);
     const sav = deriveSavings(s.output_tokens, "full", s.model);
 
-    refreshSuffix(gpa, "session", "full", s, sav);
+    refreshSuffix(io, gpa, "session", "full", s, sav);
 
     const spath = try common.statuslineSuffixPath(gpa);
     defer gpa.free(spath);
-    const got = try common.readSmall(gpa, spath);
+    const got = try common.readSmall(io, gpa, spath);
     defer gpa.free(got);
     // est_saved 1021 → humanize "1.0k" → "⛏  1.0k".
     try std.testing.expectEqualStrings("⛏  1.0k", got);
@@ -720,21 +771,22 @@ test "refreshSuffix writes ⛏ + humanized lifetime savings" {
     // History file got exactly one snapshot line for this session.
     const hpath = try common.historyPath(gpa);
     defer gpa.free(hpath);
-    const hist = common.readHistoryFile(gpa, hpath).?;
+    const hist = common.readHistoryFile(io, gpa, hpath).?;
     defer gpa.free(hist);
     try std.testing.expect(std.mem.indexOf(u8, hist, "\"session_id\":\"session\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, hist, "\"est_saved_tokens\":1021") != null);
 
     // Cleanup.
-    var sb: [std.fs.max_path_bytes]u8 = undefined;
-    _ = c.unlink(try common.toZ(&sb, spath));
-    var hb: [std.fs.max_path_bytes]u8 = undefined;
-    _ = c.unlink(try common.toZ(&hb, hpath));
+    common.unlinkFlag(io, spath);
+    common.unlinkFlag(io, hpath);
 }
 
 test "refreshSuffix empty suffix when no savings (unbenchmarked mode)" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = std.testing.allocator;
-    const dir = try common.makeTmpDir(gpa);
+    const dir = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir);
 
     const old = try common.saveEnv(gpa, "CLAUDE_CONFIG_DIR");
@@ -742,7 +794,7 @@ test "refreshSuffix empty suffix when no savings (unbenchmarked mode)" {
     defer common.restoreEnv("CLAUDE_CONFIG_DIR", old);
     const cfg = try std.fs.path.join(gpa, &.{ dir, "cfg2" });
     defer gpa.free(cfg);
-    try common.mkdirPath(cfg);
+    try common.mkdirPath(io, cfg);
     const cfg_z = try gpa.dupeZ(u8, cfg);
     defer gpa.free(cfg_z);
     _ = common.setenv("CLAUDE_CONFIG_DIR", cfg_z.ptr, 1);
@@ -752,18 +804,16 @@ test "refreshSuffix empty suffix when no savings (unbenchmarked mode)" {
     defer s.deinit(gpa);
     const sav = deriveSavings(s.output_tokens, "lite", s.model); // no ratio → 0 saved
 
-    refreshSuffix(gpa, "session2", "lite", s, sav);
+    refreshSuffix(io, gpa, "session2", "lite", s, sav);
 
     const spath = try common.statuslineSuffixPath(gpa);
     defer gpa.free(spath);
-    const got = try common.readSmall(gpa, spath);
+    const got = try common.readSmall(io, gpa, spath);
     defer gpa.free(got);
     try std.testing.expectEqualStrings("", got);
 
-    var sb: [std.fs.max_path_bytes]u8 = undefined;
-    _ = c.unlink(try common.toZ(&sb, spath));
+    common.unlinkFlag(io, spath);
     const hpath = try common.historyPath(gpa);
     defer gpa.free(hpath);
-    var hb: [std.fs.max_path_bytes]u8 = undefined;
-    _ = c.unlink(try common.toZ(&hb, hpath));
+    common.unlinkFlag(io, hpath);
 }

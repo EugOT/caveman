@@ -1,0 +1,85 @@
+name: Release binaries
+
+# On a version tag (v*), cross-compile the caveman + ponytail Zig binaries for
+# every supported platform, generate SHA-256 checksums, and attach them to the
+# GitHub Release. install.sh downloads the right per-platform archive and
+# SHA-256-verifies it (R6.2) — no Node, no Zig toolchain required by end users.
+#
+# Windows is deferred (R6-Windows: stdio/subprocess/argv libc → std.Io). The PS1
+# shims cover Windows until then, so this workflow ships macOS + Linux only.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (for manual re-runs)"
+        required: true
+
+permissions:
+  contents: write # attach assets to the Release
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: [caveman, ponytail]
+        target:
+          - { triple: aarch64-macos, name: macos-arm64 }
+          - { triple: x86_64-macos, name: macos-x64 }
+          - { triple: x86_64-linux-gnu, name: linux-x64 }
+          - { triple: aarch64-linux-gnu, name: linux-arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cross-compile ${{ matrix.tool }} for ${{ matrix.target.triple }}
+        run: |
+          nix develop --command bash -c "cd zig && zig build -Dtool=${{ matrix.tool }} -Dtarget=${{ matrix.target.triple }} -Doptimize=ReleaseSafe"
+
+      - name: Package archive + checksum
+        id: pkg
+        run: |
+          set -euo pipefail
+          tool="${{ matrix.tool }}"; plat="${{ matrix.target.name }}"
+          stage="dist/$tool-$plat"
+          mkdir -p "$stage"
+          # Ship the runtime binaries only; exclude the *-claw test binary + pdb.
+          for f in zig/zig-out/bin/$tool-*; do
+            base="$(basename "$f")"
+            case "$base" in *-claw|*.pdb) continue;; esac
+            cp "$f" "$stage/"
+          done
+          archive="$tool-$plat.tar.gz"
+          tar -C "dist/$tool-$plat" -czf "dist/$archive" .
+          ( cd dist && sha256sum "$archive" > "$archive.sha256" )
+          echo "archive=dist/$archive" >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/$archive.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            ${{ steps.pkg.outputs.archive }}
+            ${{ steps.pkg.outputs.checksum }}
+          fail_on_unmatched_files: true
+
+  # Aggregate a single SHA256SUMS manifest across all archives (install.sh reads
+  # this to verify whichever archive it downloads).
+  checksums:
+    needs: build
+    runs-on: [self-hosted, linux]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Collect per-archive checksums into SHA256SUMS
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          mkdir -p dist
+          gh release download "$tag" --pattern '*.sha256' --dir dist --repo "${{ github.repository }}" || true
+          cat dist/*.sha256 > dist/SHA256SUMS 2>/dev/null || : > dist/SHA256SUMS
+          gh release upload "$tag" dist/SHA256SUMS --clobber --repo "${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ github.token }}

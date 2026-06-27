@@ -26,6 +26,7 @@
 const std = @import("std");
 const c = std.c;
 const builtin = @import("builtin");
+const is_windows = builtin.os.tag == .windows;
 
 const common = @import("common.zig");
 const settings = @import("settings.zig");
@@ -37,23 +38,25 @@ const opencode_agent = @import("opencode_agent.zig");
 extern "c" fn fork() c.pid_t;
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 extern "c" fn close(fd: c_int) c_int;
-extern "c" fn lstat(path: [*:0]const u8, buf: *c.Stat) c_int;
-// `stat` isn't surfaced under this name in std.c for this dev build (matches
-// settings.zig's extern stat decl).
-extern "c" fn stat(path: [*:0]const u8, buf: *c.Stat) c_int;
+// R6a: the lstat/stat externs (and their c.Stat struct, which is `void` on the
+// linux/windows cross targets) are gone — the FS classification moved to
+// std.Io.Dir.statFile so this binary cross-compiles. Only portable libc dir
+// helpers (opendir/readdir/mkdir/rename/unlink) remain.
 
 pub const REPO = "JuliusBrussee/caveman";
 pub const MCP_SHRINK_PKG = "caveman-shrink";
 
-// Hook files copied by installHooks (local-clone path). Mirrors HOOK_FILES.
-const HOOK_FILES = [_][]const u8{
-    "package.json",
-    "caveman-config.js",
-    "caveman-activate.js",
-    "caveman-mode-tracker.js",
-    "caveman-stats.js",
-    "caveman-statusline.sh",
-    "caveman-statusline.ps1",
+// The four prebuilt Zig hook binaries deployed into $CLAUDE_CONFIG_DIR/hooks by
+// installHooks. These ship in the release archive (next to caveman-install) and
+// in a clone's zig/zig-out/bin — installHooks resolves the directory holding
+// them and copies these, no src/hooks/*.js (those were deleted in the R6.4
+// pure-Zig cutover). caveman-settings is an install-time helper (the settings
+// merge), NOT a hook — it is NOT deployed into the hooks dir.
+const HOOK_BINS = [_][]const u8{
+    "caveman-activate",
+    "caveman-hook",
+    "caveman-statusline",
+    "caveman-stats",
 };
 
 // ── Aliases & init-target sets (mirror PROVIDER_ALIASES / INIT_*) ─────────────
@@ -396,36 +399,30 @@ fn shellEscape(gpa: std.mem.Allocator, s: []const u8) []const u8 {
     return list.toOwnedSlice(gpa) catch s;
 }
 
-fn pathExists(path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = common.toZ(&buf, path) catch return false;
-    var st: c.Stat = undefined;
-    return stat(z, &st) == 0;
+// These three FOLLOW symlinks (Node fs.existsSync / statSync semantics) — a
+// managed dir/file reachable via a symlink counts. std.Io statFile, R6a.
+fn pathExists(io: std.Io, path: []const u8) bool {
+    _ = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = true }) catch return false;
+    return true;
 }
 
-fn isDirReal(path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = common.toZ(&buf, path) catch return false;
-    var st: c.Stat = undefined;
-    if (stat(z, &st) != 0) return false;
-    return (st.mode & c.S.IFMT) == c.S.IFDIR;
+fn isDirReal(io: std.Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = true }) catch return false;
+    return st.kind == .directory;
 }
 
-fn isFileReal(path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = common.toZ(&buf, path) catch return false;
-    var st: c.Stat = undefined;
-    if (stat(z, &st) != 0) return false;
-    return (st.mode & c.S.IFMT) == c.S.IFREG;
+fn isFileReal(io: std.Io, path: []const u8) bool {
+    const st = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = true }) catch return false;
+    return st.kind == .file;
 }
 
-fn macAppPresent(gpa: std.mem.Allocator, name: []const u8) bool {
+fn macAppPresent(io: std.Io, gpa: std.mem.Allocator, name: []const u8) bool {
     if (builtin.os.tag != .macos) return false;
     const home = common.getenv("HOME") orelse return false;
     const slash_apps = std.fmt.allocPrint(gpa, "/Applications/{s}.app", .{name}) catch return false;
-    if (pathExists(slash_apps)) return true;
+    if (pathExists(io, slash_apps)) return true;
     const user_apps = std.fmt.allocPrint(gpa, "{s}/Applications/{s}.app", .{ home, name }) catch return false;
-    return pathExists(user_apps);
+    return pathExists(io, user_apps);
 }
 
 /// Case-insensitive substring (needle assumed lowercase by caller convention).
@@ -447,7 +444,7 @@ fn dirHasEntryMatching(gpa: std.mem.Allocator, dir: []const u8, needle: []const 
     return false;
 }
 
-fn vscodeExtPresent(gpa: std.mem.Allocator, needle: []const u8) bool {
+fn vscodeExtPresent(io: std.Io, gpa: std.mem.Allocator, needle: []const u8) bool {
     const home = common.getenv("HOME") orelse return false;
     const roots = [_][]const u8{
         ".vscode/extensions", ".vscode-server/extensions",
@@ -455,21 +452,21 @@ fn vscodeExtPresent(gpa: std.mem.Allocator, needle: []const u8) bool {
     };
     for (roots) |rel| {
         const root = std.fs.path.join(gpa, &.{ home, rel }) catch continue;
-        if (!isDirReal(root)) continue;
+        if (!isDirReal(io, root)) continue;
         if (dirHasEntryMatching(gpa, root, needle)) return true;
     }
     return false;
 }
 
-fn cursorExtPresent(gpa: std.mem.Allocator, needle: []const u8) bool {
+fn cursorExtPresent(io: std.Io, gpa: std.mem.Allocator, needle: []const u8) bool {
     const home = common.getenv("HOME") orelse return false;
     const dir = std.fs.path.join(gpa, &.{ home, ".cursor/extensions" }) catch return false;
-    if (!isDirReal(dir)) return false;
+    if (!isDirReal(io, dir)) return false;
     return dirHasEntryMatching(gpa, dir, needle);
 }
 
 /// Recursive needle-in-basename walk under JetBrains config roots (depth 4).
-fn jetbrainsWalk(gpa: std.mem.Allocator, root: []const u8, needle: []const u8, depth: i32) bool {
+fn jetbrainsWalk(io: std.Io, gpa: std.mem.Allocator, root: []const u8, needle: []const u8, depth: i32) bool {
     if (depth < 0) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = common.toZ(&buf, root) catch return false;
@@ -479,36 +476,36 @@ fn jetbrainsWalk(gpa: std.mem.Allocator, root: []const u8, needle: []const u8, d
         const nm = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(&ent.name)), 0);
         if (std.mem.eql(u8, nm, ".") or std.mem.eql(u8, nm, "..")) continue;
         const child = std.fs.path.join(gpa, &.{ root, nm }) catch continue;
-        if (!isDirReal(child)) continue;
+        if (!isDirReal(io, child)) continue;
         if (containsCI(nm, needle)) return true;
-        if (jetbrainsWalk(gpa, child, needle, depth - 1)) return true;
+        if (jetbrainsWalk(io, gpa, child, needle, depth - 1)) return true;
     }
     return false;
 }
 
-fn jetbrainsPluginPresent(gpa: std.mem.Allocator, needle: []const u8) bool {
+fn jetbrainsPluginPresent(io: std.Io, gpa: std.mem.Allocator, needle: []const u8) bool {
     const home = common.getenv("HOME") orelse return false;
     const roots = [_][]const u8{
         "Library/Application Support/JetBrains", ".config/JetBrains",
     };
     for (roots) |rel| {
         const root = std.fs.path.join(gpa, &.{ home, rel }) catch continue;
-        if (!isDirReal(root)) continue;
-        if (jetbrainsWalk(gpa, root, needle, 4)) return true;
+        if (!isDirReal(io, root)) continue;
+        if (jetbrainsWalk(io, gpa, root, needle, 4)) return true;
     }
     return false;
 }
 
-fn jetbrainsPresent(gpa: std.mem.Allocator) bool {
+fn jetbrainsPresent(io: std.Io, gpa: std.mem.Allocator) bool {
     const home = common.getenv("HOME") orelse return false;
     const a = std.fs.path.join(gpa, &.{ home, "Library/Application Support/JetBrains" }) catch return false;
-    if (pathExists(a)) return true;
+    if (pathExists(io, a)) return true;
     const b = std.fs.path.join(gpa, &.{ home, ".config/JetBrains" }) catch return false;
-    return pathExists(b);
+    return pathExists(io, b);
 }
 
 /// Evaluate a detect spec ("kind:val||kind:val||..."). Mirrors detectMatch.
-fn detectMatch(gpa: std.mem.Allocator, spec: []const u8) bool {
+fn detectMatch(io: std.Io, gpa: std.mem.Allocator, spec: []const u8) bool {
     if (spec.len == 0) return false;
     var it = std.mem.splitSequence(u8, spec, "||");
     while (it.next()) |clause_raw| {
@@ -522,19 +519,19 @@ fn detectMatch(gpa: std.mem.Allocator, spec: []const u8) bool {
         if (std.mem.eql(u8, kind, "command")) {
             ok = hasCmd(gpa, val);
         } else if (std.mem.eql(u8, kind, "dir")) {
-            ok = isDirReal(val);
+            ok = isDirReal(io, val);
         } else if (std.mem.eql(u8, kind, "file")) {
-            ok = isFileReal(val);
+            ok = isFileReal(io, val);
         } else if (std.mem.eql(u8, kind, "macapp")) {
-            ok = macAppPresent(gpa, val);
+            ok = macAppPresent(io, gpa, val);
         } else if (std.mem.eql(u8, kind, "vscode-ext")) {
-            ok = vscodeExtPresent(gpa, val);
+            ok = vscodeExtPresent(io, gpa, val);
         } else if (std.mem.eql(u8, kind, "cursor-ext")) {
-            ok = cursorExtPresent(gpa, val);
+            ok = cursorExtPresent(io, gpa, val);
         } else if (std.mem.eql(u8, kind, "jetbrains-config")) {
-            ok = jetbrainsPresent(gpa);
+            ok = jetbrainsPresent(io, gpa);
         } else if (std.mem.eql(u8, kind, "jetbrains-plugin")) {
-            ok = jetbrainsPluginPresent(gpa, val);
+            ok = jetbrainsPluginPresent(io, gpa, val);
         }
         if (ok) return true;
     }
@@ -667,12 +664,15 @@ const SettingsDoc = struct {
 
 /// Read+parse a settings file. Returns null only when the file exists but is
 /// unparseable (mirrors readSettings returning null). Missing file ⇒ empty {}.
-fn readSettingsDoc(gpa: std.mem.Allocator, path: []const u8) ?SettingsDoc {
-    const raw = common.readFileAlloc(gpa, path, 16 * 1024 * 1024) orelse "";
+fn readSettingsDoc(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?SettingsDoc {
+    const raw = if (common.existsNoFollow(io, path)) blk: {
+        if (!common.isRegularFileNoSymlink(io, path)) return null;
+        break :blk common.readFileAlloc(io, gpa, path, 16 * 1024 * 1024) orelse return null;
+    } else "";
     const value = settings.parseSettings(gpa, raw) catch {
         // Existing-but-unparseable ⇒ JS null. Missing file already yields "".
         if (raw.len == 0) {
-            return .{ .arena = gpa, .value = .{ .object = .{} } };
+            return .{ .arena = gpa, .value = .{ .object = std.json.ObjectMap.init(gpa) } };
         }
         return null;
     };
@@ -680,17 +680,17 @@ fn readSettingsDoc(gpa: std.mem.Allocator, path: []const u8) ?SettingsDoc {
 }
 
 /// Atomic, symlink-safe settings.json write via common.safeWriteFlag.
-fn writeSettingsFile(gpa: std.mem.Allocator, path: []const u8, value: std.json.Value) !void {
+fn writeSettingsFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8, value: std.json.Value) !void {
     const text = try settings.stringifySettings(gpa, value);
     defer gpa.free(text);
-    try common.safeWriteFlag(gpa, path, text);
+    try common.safeWriteFlag(io, gpa, path, text);
 }
 
 // ── Repo root resolution (mirror detectRepoRoot) ──────────────────────────────
 /// Walk up from the cwd looking for a clone (src/hooks + agents + skills). The
 /// JS keys off __filename (bin/install.js); we have no install path, so use the
 /// cwd walk — same effect from inside a clone.
-fn detectRepoRoot(gpa: std.mem.Allocator) ?[]const u8 {
+fn detectRepoRoot(io: std.Io, gpa: std.mem.Allocator) ?[]const u8 {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_z = c.getcwd(&cwd_buf, cwd_buf.len) orelse return null;
     var dir: []const u8 = gpa.dupe(u8, std.mem.sliceTo(cwd_z, 0)) catch return null;
@@ -699,7 +699,7 @@ fn detectRepoRoot(gpa: std.mem.Allocator) ?[]const u8 {
         const h = std.fs.path.join(gpa, &.{ dir, "src", "hooks" }) catch return null;
         const a = std.fs.path.join(gpa, &.{ dir, "agents" }) catch return null;
         const s = std.fs.path.join(gpa, &.{ dir, "skills" }) catch return null;
-        if (isDirReal(h) and isDirReal(a) and isDirReal(s)) return dir;
+        if (isDirReal(io, h) and isDirReal(io, a) and isDirReal(io, s)) return dir;
         const parent = std.fs.path.dirname(dir) orelse return null;
         if (parent.len == dir.len) return null;
         dir = gpa.dupe(u8, parent) catch return null;
@@ -707,10 +707,56 @@ fn detectRepoRoot(gpa: std.mem.Allocator) ?[]const u8 {
     return null;
 }
 
+// ── Self binary directory resolution (sibling caveman-* binaries) ─────────────
+/// Resolve the directory holding the sibling caveman-* binaries from argv[0].
+///
+/// install.sh / install.ps1 exec caveman-install by an ABSOLUTE path — either
+/// the unpacked release archive temp dir (where caveman-init and the four hook
+/// binaries sit beside caveman-install) or zig/zig-out/bin in a clone (likewise).
+/// So argv[0]'s dirname is the binary directory in both supported launch paths.
+/// Returns null when argv[0] carries no path component (bare-name PATH lookup,
+/// which the supported launchers never do) or the dir isn't real.
+fn selfBinDirFromArgv0(io: std.Io, gpa: std.mem.Allocator, argv0: []const u8) ?[]const u8 {
+    if (argv0.len == 0) return null;
+    // No separator ⇒ resolved off $PATH; we can't locate siblings. The supported
+    // launchers always exec an absolute path, so this only trips on an unusual
+    // manual invocation — callers fall back to the clone path.
+    if (std.mem.indexOfScalar(u8, argv0, std.fs.path.sep) == null) return null;
+    const dir = std.fs.path.dirname(argv0) orelse return null;
+    // Make absolute if argv0 was relative (e.g. ./caveman-install): join cwd.
+    const abs = if (std.fs.path.isAbsolute(dir)) gpa.dupe(u8, dir) catch return null else blk: {
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd_z = c.getcwd(&cwd_buf, cwd_buf.len) orelse return null;
+        const cwd = std.mem.sliceTo(cwd_z, 0);
+        break :blk std.fs.path.join(gpa, &.{ cwd, dir }) catch return null;
+    };
+    if (!isDirReal(io, abs)) return null;
+    return abs;
+}
+
+/// Resolve a sibling caveman-* binary (e.g. "caveman-init") to an absolute path.
+/// Prefers a clone's zig/zig-out/bin (freshest local build), then the directory
+/// this binary was launched from (release archive or zig-out). Returns null when
+/// neither location holds an executable of that name — caller decides the error.
+fn resolveBin(ctx: *Ctx, name: []const u8) ?[]const u8 {
+    const gpa = ctx.gpa;
+    const io = ctx.io;
+    if (ctx.repo_root) |root| {
+        const p = std.fs.path.join(gpa, &.{ root, "zig", "zig-out", "bin", name }) catch null;
+        if (p != null and isFileReal(io, p.?)) return p.?;
+    }
+    if (ctx.self_bin_dir) |bd| {
+        const p = std.fs.path.join(gpa, &.{ bd, name }) catch null;
+        if (p != null and isFileReal(io, p.?)) return p.?;
+    }
+    return null;
+}
+
 // ── Filesystem helpers ────────────────────────────────────────────────────────
-fn mkdirP(dir: []const u8) void {
+fn mkdirP(io: std.Io, dir: []const u8) bool {
+    if (common.ancestorUnsafe(io, dir)) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (dir.len >= buf.len) return;
+    if (dir.len >= buf.len) return false;
     var i: usize = 0;
     while (i < dir.len) {
         var j = i;
@@ -723,33 +769,49 @@ fn mkdirP(dir: []const u8) void {
         }
         i = j + 1;
     }
+    return common.classify(io, dir) == .dir;
 }
 
-fn copyFile(gpa: std.mem.Allocator, src: []const u8, dest: []const u8) bool {
-    const data = common.readFileAlloc(gpa, src, 64 * 1024 * 1024) orelse return false;
+fn copyFile(io: std.Io, gpa: std.mem.Allocator, src: []const u8, dest: []const u8) bool {
+    const data = common.readFileAlloc(io, gpa, src, 64 * 1024 * 1024) orelse return false;
     defer gpa.free(data);
-    writeFile0644(dest, data) catch return false;
+    writeFile0644(io, dest, data) catch return false;
     return true;
 }
 
-fn writeFile0644(path: []const u8, content: []const u8) !void {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = try common.toZ(&pbuf, path);
-    _ = c.unlink(pz);
-    const flags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
-    const fd = c.open(pz, flags, @as(c.mode_t, 0o644));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = close(fd);
-    var written: usize = 0;
-    while (written < content.len) {
-        const n = c.write(fd, content.ptr + written, content.len - written);
-        if (n <= 0) return error.WriteFailed;
-        written += @intCast(n);
+fn writeFile0644(io: std.Io, path: []const u8, content: []const u8) !void {
+    if (common.isSymlink(io, path)) return error.SymlinkRefused;
+    const dir = std.fs.path.dirname(path) orelse ".";
+    if (common.ancestorUnsafe(io, dir)) return error.ParentSymlinkRefused;
+    if (!mkdirP(io, dir)) return error.ParentSymlinkRefused;
+
+    const tmp = try std.fmt.allocPrint(std.heap.c_allocator, "{s}.tmp.{d}", .{ path, c.getpid() });
+    defer std.heap.c_allocator.free(tmp);
+
+    const cwd = std.Io.Dir.cwd();
+    // O_CREAT|O_EXCL (refuses an existing leaf, incl. a symlink — the same
+    // clobber guard O_NOFOLLOW gave), mode 0644. std.Io, cross-compiles.
+    var f = cwd.createFile(io, tmp, .{
+        .exclusive = true,
+        .permissions = if (is_windows) .default_file else .fromMode(0o644),
+    }) catch return error.OpenFailed;
+    {
+        f.writePositionalAll(io, content, 0) catch {
+            f.close(io);
+            cwd.deleteFile(io, tmp) catch {};
+            return error.WriteFailed;
+        };
+        f.close(io);
     }
+
+    cwd.rename(tmp, cwd, path, io) catch {
+        cwd.deleteFile(io, tmp) catch {};
+        return error.RenameFailed;
+    };
 }
 
-fn copyDirRecursive(gpa: std.mem.Allocator, src: []const u8, dest: []const u8) void {
-    mkdirP(dest);
+fn copyDirRecursive(io: std.Io, gpa: std.mem.Allocator, src: []const u8, dest: []const u8) void {
+    if (!mkdirP(io, dest)) return;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const z = common.toZ(&buf, src) catch return;
     const dp = c.opendir(z) orelse return;
@@ -759,10 +821,10 @@ fn copyDirRecursive(gpa: std.mem.Allocator, src: []const u8, dest: []const u8) v
         if (std.mem.eql(u8, nm, ".") or std.mem.eql(u8, nm, "..")) continue;
         const s = std.fs.path.join(gpa, &.{ src, nm }) catch continue;
         const d = std.fs.path.join(gpa, &.{ dest, nm }) catch continue;
-        if (isDirReal(s)) {
-            copyDirRecursive(gpa, s, d);
-        } else if (isFileReal(s)) {
-            _ = copyFile(gpa, s, d);
+        if (isDirReal(io, s)) {
+            copyDirRecursive(io, gpa, s, d);
+        } else if (isFileReal(io, s)) {
+            _ = copyFile(io, gpa, s, d);
         }
     }
 }
@@ -777,9 +839,18 @@ const Results = struct {
 
 const Ctx = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
     opts: *Opts,
     config_dir: []const u8,
     repo_root: ?[]const u8,
+    // Directory holding the sibling caveman-* binaries (caveman-init, the four
+    // hook binaries). Resolved from argv[0] in main(): in the release archive
+    // every caveman-* binary unpacks into one temp dir and install.sh execs
+    // caveman-install by its absolute path; in a clone the launcher execs
+    // zig/zig-out/bin/caveman-install — same directory holds the siblings. Used
+    // by installHooks (deploy hook binaries) and runInit (exec caveman-init)
+    // when no clone source tree is available.
+    self_bin_dir: ?[]const u8,
     results: *Results,
     color: Chalk,
 
@@ -971,6 +1042,7 @@ fn fmt(ctx: *Ctx, comptime f: []const u8, args: anytype) []const u8 {
 // ── installClaude ─────────────────────────────────────────────────────────────
 fn installClaude(ctx: *Ctx) void {
     const gpa = ctx.gpa;
+    const io = ctx.io;
     const opts = ctx.opts;
     ctx.results.detected += 1;
     ctx.say("→ Claude Code detected");
@@ -1006,17 +1078,17 @@ fn installClaude(ctx: *Ctx) void {
     // Self-heal orphaned managed hooks (prune).
     {
         const settings_path = std.fs.path.join(gpa, &.{ ctx.config_dir, "settings.json" }) catch ctx.config_dir;
-        if (isFileReal(settings_path)) {
-            if (readSettingsDoc(gpa, settings_path)) |doc_const| {
+        if (isFileReal(io, settings_path)) {
+            if (readSettingsDoc(io, gpa, settings_path)) |doc_const| {
                 var doc = doc_const;
                 defer doc.deinit();
                 const arena = doc.arena;
-                const pruned = settings.pruneOrphanedManagedHooks(arena, &doc.value, ctx.config_dir) catch 0;
+                const pruned = settings.pruneOrphanedManagedHooks(io, arena, &doc.value, ctx.config_dir) catch 0;
                 if (pruned > 0) {
                     ctx.note(fmt(ctx, "  removed {d} orphaned caveman hook entr{s} from settings.json (target script missing)", .{ pruned, if (pruned == 1) "y" else "ies" }));
                     if (!opts.dry_run) {
                         settings.validateHookFields(arena, &doc.value) catch {};
-                        writeSettingsFile(gpa, settings_path, doc.value) catch {};
+                        writeSettingsFile(io, gpa, settings_path, doc.value) catch {};
                     }
                 }
             }
@@ -1111,13 +1183,20 @@ fn installViaSkills(ctx: *Ctx, prov: Provider) void {
 // ── installOpencode (native plugin copy + AGENTS.md, reuses opencode_agent) ────
 fn installOpencode(ctx: *Ctx) void {
     const gpa = ctx.gpa;
+    const io = ctx.io;
     const opts = ctx.opts;
     ctx.results.detected += 1;
     ctx.say("→ opencode detected");
 
     const repo_root = ctx.repo_root orelse {
-        ctx.warn("  opencode native install requires a local clone of the caveman repo.");
-        ctx.note("  Re-run from a clone: git clone https://github.com/" ++ REPO ++ " && cd caveman && node bin/install.js --only opencode");
+        // The opencode native install copies JS plugin source (plugin.js +
+        // caveman-config.cjs), command/agent markdown, skill directories, and the
+        // AGENTS.md rule body — none of which are binaries, so they are NOT in the
+        // release archive. A clone is required. (No download path yet; if added,
+        // installOpencode would fetch those text assets from the release/raw URL.)
+        ctx.warn("  opencode native install requires a local clone of the caveman repo");
+        ctx.warn("  (it copies the JS plugin + skills/agents/commands, not shipped in the release archive).");
+        ctx.note("  Re-run from a clone: git clone https://github.com/" ++ REPO ++ " && cd caveman && bash install.sh --only opencode");
         pushFailed(ctx, "opencode", "native install requires local repo clone");
         out("\n");
         return;
@@ -1145,81 +1224,114 @@ fn installOpencode(ctx: *Ctx) void {
     }
 
     // 1. Plugin dir.
-    mkdirP(plugin_dir);
+    if (!mkdirP(io, plugin_dir)) {
+        pushFailed(ctx, "opencode", "unsafe plugin directory");
+        out("\n");
+        return;
+    }
     const plugin_src = std.fs.path.join(gpa, &.{ repo_root, "src", "plugins", "opencode" }) catch return;
     {
         const PayloadPair = struct { src: []const u8, dest: []const u8 };
         const payload = [_]PayloadPair{
             .{ .src = std.fs.path.join(gpa, &.{ plugin_src, "plugin.js" }) catch return, .dest = std.fs.path.join(gpa, &.{ plugin_dir, "plugin.js" }) catch return },
             .{ .src = std.fs.path.join(gpa, &.{ plugin_src, "package.json" }) catch return, .dest = std.fs.path.join(gpa, &.{ plugin_dir, "package.json" }) catch return },
-            .{ .src = std.fs.path.join(gpa, &.{ repo_root, "src", "hooks", "caveman-config.js" }) catch return, .dest = std.fs.path.join(gpa, &.{ plugin_dir, "caveman-config.cjs" }) catch return },
+            // The opencode flag-helper shim now lives next to plugin.js as its
+            // canonical source (src/plugins/opencode/caveman-config.cjs) after the
+            // pure-Zig cutover (R6.4) deleted src/hooks/caveman-config.js. Copy it
+            // straight from the plugin dir — same name, no rename needed.
+            .{ .src = std.fs.path.join(gpa, &.{ plugin_src, "caveman-config.cjs" }) catch return, .dest = std.fs.path.join(gpa, &.{ plugin_dir, "caveman-config.cjs" }) catch return },
         };
         for (payload) |p| {
-            if (isFileReal(p.dest) and !opts.force) {
+            if (isFileReal(io, p.dest) and !opts.force) {
                 ctx.note(fmt(ctx, "  skipped {s} (exists; --force to overwrite)", .{p.dest}));
                 continue;
             }
-            _ = copyFile(gpa, p.src, p.dest);
+            _ = copyFile(io, gpa, p.src, p.dest);
         }
     }
     out(fmt(ctx, "  installed: {s}\n", .{plugin_dir}));
 
     // 2. Commands.
-    mkdirP(commands_dir);
+    if (!mkdirP(io, commands_dir)) {
+        pushFailed(ctx, "opencode", "unsafe commands directory");
+        out("\n");
+        return;
+    }
     const cmd_src_dir = std.fs.path.join(gpa, &.{ plugin_src, "commands" }) catch return;
     for (OPENCODE_COMMAND_FILES) |f| {
         const s = std.fs.path.join(gpa, &.{ cmd_src_dir, f }) catch continue;
         const d = std.fs.path.join(gpa, &.{ commands_dir, f }) catch continue;
-        if (!isFileReal(s)) continue;
-        if (isFileReal(d) and !opts.force) {
+        if (!isFileReal(io, s)) continue;
+        if (isFileReal(io, d) and !opts.force) {
             ctx.note(fmt(ctx, "  skipped {s} (exists; --force to overwrite)", .{d}));
             continue;
         }
-        _ = copyFile(gpa, s, d);
+        _ = copyFile(io, gpa, s, d);
         out(fmt(ctx, "  installed: {s}\n", .{d}));
     }
 
     // 3. Subagents — strip tools: via opencode_agent.stripOpencodeAgentTools.
-    mkdirP(agents_dir);
+    if (!mkdirP(io, agents_dir)) {
+        pushFailed(ctx, "opencode", "unsafe agents directory");
+        out("\n");
+        return;
+    }
     const agent_src_dir = std.fs.path.join(gpa, &.{ repo_root, "agents" }) catch return;
     for (OPENCODE_AGENT_FILES) |f| {
         const s = std.fs.path.join(gpa, &.{ agent_src_dir, f }) catch continue;
         const d = std.fs.path.join(gpa, &.{ agents_dir, f }) catch continue;
-        if (!isFileReal(s)) continue;
-        if (isFileReal(d) and !opts.force) {
+        if (!isFileReal(io, s)) continue;
+        if (isFileReal(io, d) and !opts.force) {
             ctx.note(fmt(ctx, "  skipped {s} (exists; --force to overwrite)", .{d}));
             continue;
         }
-        const raw = common.readFileAlloc(gpa, s, 16 * 1024 * 1024) orelse continue;
+        const raw = common.readFileAlloc(io, gpa, s, 16 * 1024 * 1024) orelse continue;
         const stripped = opencode_agent.stripOpencodeAgentTools(gpa, raw) catch continue;
-        writeFile0644(d, stripped) catch continue;
+        writeFile0644(io, d, stripped) catch continue;
         out(fmt(ctx, "  installed: {s}\n", .{d}));
     }
 
     // 4. Skills.
-    mkdirP(skills_dir);
+    if (!mkdirP(io, skills_dir)) {
+        pushFailed(ctx, "opencode", "unsafe skills directory");
+        out("\n");
+        return;
+    }
     const skill_src_dir = std.fs.path.join(gpa, &.{ repo_root, "skills" }) catch return;
     for (OPENCODE_SKILL_DIRS) |name| {
         const s = std.fs.path.join(gpa, &.{ skill_src_dir, name }) catch continue;
         const d = std.fs.path.join(gpa, &.{ skills_dir, name }) catch continue;
-        if (!isDirReal(s)) continue;
-        if (isDirReal(d) and !opts.force) {
+        if (!isDirReal(io, s)) continue;
+        if (isDirReal(io, d) and !opts.force) {
             ctx.note(fmt(ctx, "  skipped {s}/ (exists; --force to overwrite)", .{d}));
             continue;
         }
-        copyDirRecursive(gpa, s, d);
+        copyDirRecursive(io, gpa, s, d);
         out(fmt(ctx, "  installed: {s}/\n", .{d}));
     }
 
     // 5. AGENTS.md ruleset (fenced).
     {
         const rule_path = std.fs.path.join(gpa, &.{ repo_root, "src", "rules", "caveman-activate.md" }) catch return;
-        const rule_raw = common.readFileAlloc(gpa, rule_path, 4 * 1024 * 1024) orelse "";
+        const rule_raw = common.readFileAlloc(io, gpa, rule_path, 4 * 1024 * 1024) orelse {
+            pushFailed(ctx, "opencode", "ruleset read failed");
+            out("\n");
+            return;
+        };
         const rule_body = std.mem.concat(gpa, u8, &.{ std.mem.trimEnd(u8, rule_raw, " \t\r\n"), "\n" }) catch return;
         const fenced = std.mem.concat(gpa, u8, &.{ OPENCODE_AGENTS_MD_BEGIN, "\n", rule_body, OPENCODE_AGENTS_MD_END, "\n" }) catch return;
 
-        if (isFileReal(agents_md)) {
-            const existing = common.readFileAlloc(gpa, agents_md, 4 * 1024 * 1024) orelse "";
+        if (common.existsNoFollow(io, agents_md)) {
+            if (!common.isRegularFileNoSymlink(io, agents_md)) {
+                pushFailed(ctx, "opencode", "unsafe AGENTS.md");
+                out("\n");
+                return;
+            }
+            const existing = common.readFileAlloc(io, gpa, agents_md, 4 * 1024 * 1024) orelse {
+                pushFailed(ctx, "opencode", "AGENTS.md read failed");
+                out("\n");
+                return;
+            };
             const fenced_present = std.mem.indexOf(u8, existing, OPENCODE_AGENTS_MD_BEGIN) != null and std.mem.indexOf(u8, existing, OPENCODE_AGENTS_MD_END) != null;
             const legacy = !fenced_present and std.mem.indexOf(u8, existing, OPENCODE_AGENTS_MD_SENTINEL) != null;
             if (fenced_present) {
@@ -1228,36 +1340,48 @@ fn installOpencode(ctx: *Ctx) void {
                 ctx.note(fmt(ctx, "  {s} contains a legacy (un-fenced) caveman block — leaving as-is", .{agents_md}));
                 ctx.note("  re-run with --force to replace it with a fenced block");
                 if (opts.force) {
-                    writeFile0644(agents_md, fenced) catch {};
+                    writeFile0644(io, agents_md, fenced) catch {
+                        pushFailed(ctx, "opencode", "AGENTS.md write failed");
+                        out("\n");
+                        return;
+                    };
                     out(fmt(ctx, "  rewrote {s} with fenced caveman block\n", .{agents_md}));
                 }
             } else {
                 const sep = if (std.mem.endsWith(u8, existing, "\n\n")) "" else if (std.mem.endsWith(u8, existing, "\n")) "\n" else "\n\n";
                 const next = std.mem.concat(gpa, u8, &.{ existing, sep, fenced }) catch return;
-                writeFile0644(agents_md, next) catch {};
+                writeFile0644(io, agents_md, next) catch {
+                    pushFailed(ctx, "opencode", "AGENTS.md write failed");
+                    out("\n");
+                    return;
+                };
                 out(fmt(ctx, "  appended caveman ruleset to {s}\n", .{agents_md}));
             }
         } else {
-            writeFile0644(agents_md, fenced) catch {};
+            writeFile0644(io, agents_md, fenced) catch {
+                pushFailed(ctx, "opencode", "AGENTS.md write failed");
+                out("\n");
+                return;
+            };
             out(fmt(ctx, "  installed: {s}\n", .{agents_md}));
         }
     }
 
     // 6. opencode.json — add plugin entry; optional caveman-shrink MCP.
     {
-        if (readSettingsDoc(gpa, opencode_json)) |doc_const| {
+        if (readSettingsDoc(io, gpa, opencode_json)) |doc_const| {
             var doc = doc_const;
             defer doc.deinit();
             const arena = doc.arena;
             // .bak on first install only.
             const bak = std.mem.concat(gpa, u8, &.{ opencode_json, ".bak" }) catch opencode_json;
-            if (isFileReal(opencode_json) and !pathExists(bak)) {
-                _ = copyFile(gpa, opencode_json, bak);
+            if (isFileReal(io, opencode_json) and !pathExists(io, bak)) {
+                _ = copyFile(io, gpa, opencode_json, bak);
             }
-            if (doc.value != .object) doc.value = .{ .object = .{} };
+            if (doc.value != .object) doc.value = .{ .object = std.json.ObjectMap.init(arena) };
             // plugin array.
             if (doc.value.object.get("plugin") == null or doc.value.object.get("plugin").? != .array) {
-                doc.value.object.put(arena, "plugin", .{ .array = std.json.Array.init(arena) }) catch {};
+                doc.value.object.put("plugin", .{ .array = std.json.Array.init(arena) }) catch {};
             }
             const plugin_ptr = doc.value.object.getPtr("plugin").?;
             var has_plugin = false;
@@ -1268,12 +1392,12 @@ fn installOpencode(ctx: *Ctx) void {
 
             if (opts.with_mcp_shrink) {
                 if (doc.value.object.get("mcp") == null or doc.value.object.get("mcp").? != .object) {
-                    doc.value.object.put(arena, "mcp", .{ .object = .{} }) catch {};
+                    doc.value.object.put("mcp", .{ .object = std.json.ObjectMap.init(arena) }) catch {};
                 }
                 const mcp_ptr = doc.value.object.getPtr("mcp").?;
                 if (mcp_ptr.object.get("caveman-shrink") == null) {
-                    var entry: std.json.ObjectMap = .{};
-                    entry.put(arena, "type", .{ .string = "local" }) catch {};
+                    var entry = std.json.ObjectMap.init(arena);
+                    entry.put("type", .{ .string = "local" }) catch {};
                     var cmd_arr = std.json.Array.init(arena);
                     cmd_arr.append(.{ .string = "npx" }) catch {};
                     cmd_arr.append(.{ .string = "-y" }) catch {};
@@ -1282,13 +1406,13 @@ fn installOpencode(ctx: *Ctx) void {
                         var tit = std.mem.tokenizeAny(u8, joined, " ");
                         while (tit.next()) |tok| cmd_arr.append(.{ .string = arena.dupe(u8, tok) catch tok }) catch {};
                     }
-                    entry.put(arena, "command", .{ .array = cmd_arr }) catch {};
-                    entry.put(arena, "enabled", .{ .bool = true }) catch {};
-                    mcp_ptr.object.put(arena, "caveman-shrink", .{ .object = entry }) catch {};
+                    entry.put("command", .{ .array = cmd_arr }) catch {};
+                    entry.put("enabled", .{ .bool = true }) catch {};
+                    mcp_ptr.object.put("caveman-shrink", .{ .object = entry }) catch {};
                     out(fmt(ctx, "  registered caveman-shrink MCP server (wraps: {s})\n", .{opts.mcp_shrink_cmd orelse ""}));
                 }
             }
-            writeSettingsFile(gpa, opencode_json, doc.value) catch {};
+            writeSettingsFile(io, gpa, opencode_json, doc.value) catch {};
             out(fmt(ctx, "  patched: {s}\n", .{opencode_json}));
             pushInstalled(ctx, "opencode");
         } else {
@@ -1305,6 +1429,7 @@ fn installOpencode(ctx: *Ctx) void {
 // ── installOpenclaw / installNullclaw (reuse zig modules) ─────────────────────
 fn installOpenclaw(ctx: *Ctx) void {
     const gpa = ctx.gpa;
+    const io = ctx.io;
     const opts = ctx.opts;
     ctx.results.detected += 1;
     ctx.say("→ OpenClaw detected");
@@ -1336,7 +1461,7 @@ fn installOpenclaw(ctx: *Ctx) void {
         return;
     }
 
-    const r = openclaw.installOpenclaw(gpa, ws, skill_body, snippet, opts.dry_run, opts.force) catch {
+    const r = openclaw.installOpenclaw(io, gpa, ws, skill_body, snippet, opts.dry_run, opts.force) catch {
         pushFailed(ctx, "openclaw", "install failed");
         out("\n");
         return;
@@ -1347,6 +1472,7 @@ fn installOpenclaw(ctx: *Ctx) void {
 
 fn installNullclaw(ctx: *Ctx) void {
     const gpa = ctx.gpa;
+    const io = ctx.io;
     const opts = ctx.opts;
     ctx.results.detected += 1;
     ctx.say("→ NullClaw detected");
@@ -1370,7 +1496,7 @@ fn installNullclaw(ctx: *Ctx) void {
         return;
     }
 
-    const r = nullclaw.installNullclaw(gpa, ws, skill_body, opts.dry_run, opts.force) catch {
+    const r = nullclaw.installNullclaw(io, gpa, ws, skill_body, opts.dry_run, opts.force) catch {
         pushFailed(ctx, "nullclaw", "install failed");
         out("\n");
         return;
@@ -1382,54 +1508,66 @@ fn installNullclaw(ctx: *Ctx) void {
 fn readRepoFile(ctx: *Ctx, rel: []const u8) ?[]u8 {
     const root = ctx.repo_root orelse return null;
     const full = std.fs.path.join(ctx.gpa, &.{ root, rel }) catch return null;
-    return common.readFileAlloc(ctx.gpa, full, 16 * 1024 * 1024);
+    return common.readFileAlloc(ctx.io, ctx.gpa, full, 16 * 1024 * 1024);
 }
 
-// ── installHooks (local-clone copy path; download DEFERRED to R4c) ────────────
+// ── installHooks (deploy prebuilt Zig hook binaries + wire settings.json) ─────
+// Deploys the four native hook binaries (caveman-activate / caveman-hook /
+// caveman-statusline / caveman-stats) from the resolved binary directory (a
+// clone's zig/zig-out/bin, or the unpacked release archive this binary was
+// launched from) into $CLAUDE_CONFIG_DIR/hooks, then wires SessionStart +
+// UserPromptSubmit + statusLine into settings.json via settings.addCavemanHooks.
+// No node, no src/hooks/*.js — those were deleted in the R6.4 pure-Zig cutover.
 fn installHooks(ctx: *Ctx) []const u8 {
     const gpa = ctx.gpa;
+    const io = ctx.io;
     const opts = ctx.opts;
     const hooks_dir = std.fs.path.join(gpa, &.{ ctx.config_dir, "hooks" }) catch return "alloc failed";
     const settings_path = std.fs.path.join(gpa, &.{ ctx.config_dir, "settings.json" }) catch return "alloc failed";
-    const source_dir: ?[]const u8 = if (ctx.repo_root) |r| std.fs.path.join(gpa, &.{ r, "src", "hooks" }) catch null else null;
+
+    // Resolve the source dir holding the prebuilt hook binaries: clone's
+    // zig/zig-out/bin first, else the dir this binary was launched from (archive
+    // temp dir or zig-out). Require every hook binary to be present there.
+    const bin_dir: ?[]const u8 = blk: {
+        if (resolveBin(ctx, HOOK_BINS[0])) |first| break :blk std.fs.path.dirname(first);
+        break :blk null;
+    };
+    if (bin_dir == null) {
+        return "hook binaries not found beside caveman-install (run install.sh, or from a built clone)";
+    }
+    for (HOOK_BINS) |b| {
+        const s = std.fs.path.join(gpa, &.{ bin_dir.?, b }) catch return "alloc failed";
+        if (!isFileReal(io, s)) return fmt(ctx, "hook binary missing from release/clone: {s}", .{b});
+    }
 
     if (opts.dry_run) {
         ctx.note(fmt(ctx, "  would mkdir -p {s}", .{hooks_dir}));
-        for (HOOK_FILES) |f| {
-            const d = std.fs.path.join(gpa, &.{ hooks_dir, f }) catch continue;
+        for (HOOK_BINS) |b| {
+            const d = std.fs.path.join(gpa, &.{ hooks_dir, b }) catch continue;
             ctx.note(fmt(ctx, "  would install {s}", .{d}));
         }
         ctx.note(fmt(ctx, "  would merge SessionStart + UserPromptSubmit + statusline into {s}", .{settings_path}));
         return "ok";
     }
 
-    mkdirP(hooks_dir);
+    if (!mkdirP(io, hooks_dir)) return "mkdir hooks failed";
 
-    // Copy each hook file from the local clone. The remote-download + SHA-256
-    // verify fallback is DEFERRED to R4c (network path). Without a clone we
-    // cannot proceed.
-    for (HOOK_FILES) |f| {
-        const dest = std.fs.path.join(gpa, &.{ hooks_dir, f }) catch return "alloc failed";
-        const src: ?[]const u8 = if (source_dir) |sd| std.fs.path.join(gpa, &.{ sd, f }) catch null else null;
-        if (src != null and isFileReal(src.?)) {
-            if (!copyFile(gpa, src.?, dest)) return fmt(ctx, "copy {s} failed", .{f});
-        } else {
-            return fmt(ctx, "download {s} not supported in this build (R4c) — run from a local clone", .{f});
-        }
+    // Deploy each hook binary, then chmod 0755 (executables, invoked directly).
+    for (HOOK_BINS) |b| {
+        const src = std.fs.path.join(gpa, &.{ bin_dir.?, b }) catch return "alloc failed";
+        const dest = std.fs.path.join(gpa, &.{ hooks_dir, b }) catch return "alloc failed";
+        if (!copyFile(io, gpa, src, dest)) return fmt(ctx, "copy {s} failed", .{b});
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (common.toZ(&buf, dest)) |z| {
+            _ = c.chmod(z, 0o755);
+        } else |_| {}
         out(fmt(ctx, "  installed: {s}\n", .{dest}));
     }
 
-    // chmod statusline.sh 0755.
-    {
-        const sl = std.fs.path.join(gpa, &.{ hooks_dir, "caveman-statusline.sh" }) catch hooks_dir;
-        var b: [std.fs.max_path_bytes]u8 = undefined;
-        if (common.toZ(&b, sl)) |z| {
-            _ = c.chmod(z, 0o755);
-        } else |_| {}
-    }
-
-    // Merge into settings.json.
-    var doc = readSettingsDoc(gpa, settings_path) orelse {
+    // Merge into settings.json via settings.addCavemanHooks (binary paths, no
+    // interpreter). Same idempotent merge install.sh drives through
+    // caveman-settings.
+    var doc = readSettingsDoc(io, gpa, settings_path) orelse {
         ctx.warn("  settings.json unparseable; will not touch it. Edit manually then re-run.");
         return "settings.json unparseable";
     };
@@ -1439,79 +1577,24 @@ fn installHooks(ctx: *Ctx) []const u8 {
     // Backup once.
     {
         const bak = std.mem.concat(gpa, u8, &.{ settings_path, ".bak" }) catch settings_path;
-        if (isFileReal(settings_path) and !pathExists(bak)) _ = copyFile(gpa, settings_path, bak);
+        if (isFileReal(io, settings_path) and !pathExists(io, bak)) _ = copyFile(io, gpa, settings_path, bak);
     }
 
-    const node = nodePath(gpa);
-    const activate = std.fs.path.join(gpa, &.{ hooks_dir, "caveman-activate.js" }) catch hooks_dir;
-    const tracker = std.fs.path.join(gpa, &.{ hooks_dir, "caveman-mode-tracker.js" }) catch hooks_dir;
-    const statusline = std.fs.path.join(gpa, &.{ hooks_dir, "caveman-statusline.sh" }) catch hooks_dir;
-
-    _ = settings.rewriteLegacyManagedHookCommands(arena, &doc.value, node) catch 0;
-
-    _ = settings.addCommandHook(arena, &doc.value, "SessionStart", .{
-        .command = fmt(ctx, "\"{s}\" \"{s}\"", .{ node, activate }),
-        .marker = "caveman-activate",
-        .timeout = 5,
-        .status_message = "Loading caveman mode...",
-    }) catch {};
-
-    _ = settings.addCommandHook(arena, &doc.value, "UserPromptSubmit", .{
-        .command = fmt(ctx, "\"{s}\" \"{s}\"", .{ node, tracker }),
-        .marker = "caveman-mode-tracker",
-        .timeout = 5,
-        .status_message = "Tracking caveman mode...",
-    }) catch {};
-
-    // Statusline (POSIX: bash "<statusline>"). Windows path is out of scope.
-    {
-        const sl_cmd = fmt(ctx, "bash \"{s}\"", .{statusline});
-        if (doc.value == .object and doc.value.object.get("statusLine") == null) {
-            var slo: std.json.ObjectMap = .{};
-            slo.put(arena, "type", .{ .string = "command" }) catch {};
-            slo.put(arena, "command", .{ .string = sl_cmd }) catch {};
-            doc.value.object.put(arena, "statusLine", .{ .object = slo }) catch {};
-            out("  statusline badge configured.\n");
-        } else if (doc.value == .object) {
-            const sl_val = doc.value.object.get("statusLine").?;
-            const existing = switch (sl_val) {
-                .string => |s| s,
-                .object => |o| if (o.get("command")) |cv| (if (cv == .string) cv.string else "") else "",
-                else => "",
-            };
-            if (std.mem.indexOf(u8, existing, statusline) != null or std.mem.indexOf(u8, existing, "caveman-statusline") != null) {
-                out("  statusline badge already configured.\n");
-            } else {
-                out("  NOTE: existing statusline detected — caveman badge NOT added.\n");
-                out("        See src/hooks/README.md to add the badge to your existing statusline.\n");
-            }
-        }
+    const sl = settings.addCavemanHooks(arena, &doc.value, hooks_dir) catch {
+        return "settings merge failed";
+    };
+    switch (sl) {
+        .configured => out("  statusline badge configured.\n"),
+        .already => out("  statusline badge already configured.\n"),
+        .skipped => {
+            out("  NOTE: existing statusline detected — caveman badge NOT added.\n");
+            out("        See src/hooks/README.md to add the badge to your existing statusline.\n");
+        },
     }
 
-    settings.validateHookFields(arena, &doc.value) catch {};
-    writeSettingsFile(gpa, settings_path, doc.value) catch {};
+    writeSettingsFile(io, gpa, settings_path, doc.value) catch {};
     out(fmt(ctx, "  hooks wired in {s}\n", .{settings_path}));
     return "ok";
-}
-
-fn nodePath(gpa: std.mem.Allocator) []const u8 {
-    // The JS installer uses process.execPath — the absolute path to the node
-    // binary running it — so hooks/init are invoked with an explicit interpreter
-    // path. This standalone Zig binary has no node process, so we resolve the
-    // absolute path of `node` on PATH via `command -v` (the closest analogue).
-    // Falls back to the bare name if resolution fails.
-    const argv = [_][:0]const u8{
-        gpa.dupeZ(u8, "/bin/sh") catch return "node",
-        gpa.dupeZ(u8, "-c") catch return "node",
-        gpa.dupeZ(u8, "command -v node") catch return "node",
-    };
-    if (captureSpawn(gpa, &argv)) |cap| {
-        if (cap.status == 0) {
-            const trimmed = std.mem.trim(u8, cap.stdout, " \t\r\n");
-            if (trimmed.len > 0) return gpa.dupe(u8, trimmed) catch "node";
-        }
-    }
-    return "node";
 }
 
 // ── installMcpShrink ──────────────────────────────────────────────────────────
@@ -1560,7 +1643,13 @@ fn installMcpShrink(ctx: *Ctx) McpResult {
     return .{ .kind = "fail", .why = "claude mcp add failed" };
 }
 
-// ── runInit (dispatch to caveman-init binary, then node script) ───────────────
+// ── runInit (exec the bundled caveman-init Zig binary) ────────────────────────
+// The per-repo rule writer is a native binary (caveman-init). It @embedFile's
+// the rule + skill bodies at build time, so it is fully self-contained — it
+// needs no src/ source tree at runtime. resolveBin finds it in a clone's
+// zig/zig-out/bin or beside caveman-install in the unpacked release archive.
+// (The deleted src/tools/caveman-init.js node path and its remote-fetch
+// fallback are gone — pure-Zig cutover, R6.4.)
 fn runInit(ctx: *Ctx) bool {
     const gpa = ctx.gpa;
     const opts = ctx.opts;
@@ -1587,28 +1676,24 @@ fn runInit(ctx: *Ctx) bool {
         return true;
     }
 
-    // Prefer the local src/tools/caveman-init.js (mirror JS). If a clone exists,
-    // run it via node. Otherwise refuse (no detached single-file path).
-    if (ctx.repo_root) |root| {
-        const init_js = std.fs.path.join(gpa, &.{ root, "src/tools/caveman-init.js" }) catch null;
-        if (init_js != null and isFileReal(init_js.?)) {
-            var argv: std.ArrayList([]const u8) = .empty;
-            argv.append(gpa, nodePath(gpa)) catch {};
-            argv.append(gpa, init_js.?) catch {};
-            argv.appendSlice(gpa, init_args.items) catch {};
-            const r = runSpawn(gpa, argv.items, opts.dry_run);
-            return r == 0;
-        }
-    }
-    ctx.warn("  local src/tools/caveman-init.js not found; refusing detached single-file --with-init");
-    ctx.warn("  run from a full package/clone so repo-local aliases use the matching init script");
-    ctx.warn(fmt(ctx, "  skipped remote fallback: https://raw.githubusercontent.com/{s}/v1.9.0/src/tools/caveman-init.js", .{REPO}));
-    return false;
+    const init_bin = resolveBin(ctx, "caveman-init") orelse {
+        ctx.warn("  caveman-init binary not found beside caveman-install");
+        ctx.warn("  re-run via install.sh (it ships caveman-init in the release archive)");
+        ctx.warn("  or from a built clone (zig build -Dtool=caveman writes zig/zig-out/bin/caveman-init)");
+        return false;
+    };
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.append(gpa, init_bin) catch {};
+    argv.appendSlice(gpa, init_args.items) catch {};
+    const r = runSpawn(gpa, argv.items, opts.dry_run);
+    return r == 0;
 }
 
 // ── uninstall ─────────────────────────────────────────────────────────────────
 fn uninstall(ctx: *Ctx) void {
     const gpa = ctx.gpa;
+    const io = ctx.io;
     const opts = ctx.opts;
     ctx.say("🪨 caveman uninstall");
     if (opts.dry_run) ctx.note("  (dry run — nothing will be removed)");
@@ -1617,8 +1702,8 @@ fn uninstall(ctx: *Ctx) void {
     const settings_path = std.fs.path.join(gpa, &.{ ctx.config_dir, "settings.json" }) catch ctx.config_dir;
 
     // Strip caveman hooks + statusline from settings.json (settings.zig).
-    if (isFileReal(settings_path)) {
-        if (readSettingsDoc(gpa, settings_path)) |doc_const| {
+    if (isFileReal(io, settings_path)) {
+        if (readSettingsDoc(io, gpa, settings_path)) |doc_const| {
             var doc = doc_const;
             defer doc.deinit();
             const arena = doc.arena;
@@ -1637,7 +1722,7 @@ fn uninstall(ctx: *Ctx) void {
             }
             settings.validateHookFields(arena, &doc.value) catch {};
             if (!opts.dry_run) {
-                if (writeSettingsFile(gpa, settings_path, doc.value)) {
+                if (writeSettingsFile(io, gpa, settings_path, doc.value)) {
                     ctx.ok(fmt(ctx, "  removed {d} caveman hook entr{s} from settings.json", .{ removed, if (removed == 1) "y" else "ies" }));
                 } else |_| {
                     ctx.warn(fmt(ctx, "  could not update {s}", .{settings_path}));
@@ -1648,16 +1733,30 @@ fn uninstall(ctx: *Ctx) void {
         }
     }
 
-    // Delete hook files.
-    if (isDirReal(hooks_dir)) {
-        for (HOOK_FILES) |f| {
+    // Delete hook binaries (and any legacy pre-cutover JS/shell leftovers).
+    const LEGACY_HOOK_FILES = [_][]const u8{
+        "package.json",            "caveman-config.js", "caveman-activate.js",
+        "caveman-mode-tracker.js", "caveman-stats.js",  "caveman-statusline.sh",
+        "caveman-statusline.ps1",
+    };
+    if (common.classify(io, hooks_dir) == .dir) {
+        for (HOOK_BINS) |f| {
             const p = std.fs.path.join(gpa, &.{ hooks_dir, f }) catch continue;
-            if (!pathExists(p)) continue;
+            if (!pathExists(io, p)) continue;
             if (!opts.dry_run) {
                 var b: [std.fs.max_path_bytes]u8 = undefined;
                 if (common.toZ(&b, p)) |z| _ = c.unlink(z) else |_| {}
             }
             ctx.note(fmt(ctx, "  removed {s}", .{p}));
+        }
+        for (LEGACY_HOOK_FILES) |f| {
+            const p = std.fs.path.join(gpa, &.{ hooks_dir, f }) catch continue;
+            if (!pathExists(io, p)) continue;
+            if (!opts.dry_run) {
+                var b: [std.fs.max_path_bytes]u8 = undefined;
+                if (common.toZ(&b, p)) |z| _ = c.unlink(z) else |_| {}
+            }
+            ctx.note(fmt(ctx, "  removed {s} (legacy)", .{p}));
         }
     }
 
@@ -1713,17 +1812,17 @@ fn uninstall(ctx: *Ctx) void {
         };
         const skill = std.fs.path.join(gpa, &.{ ws, "skills", "caveman" }) catch "";
         const soul = std.fs.path.join(gpa, &.{ ws, "SOUL.md" }) catch "";
-        if (pathExists(skill) or pathExists(soul)) {
+        if (common.classify(io, skill) == .dir or common.isRegularFileNoSymlink(io, soul)) {
             // The stage-1 openclaw.uninstallOpenclaw module is silent; emit the
             // same per-file notes the JS log object produced (existence-gated,
             // dry-run wording matches bin/lib/openclaw.js uninstallOpenclaw).
-            if (pathExists(skill)) {
+            if (common.classify(io, skill) == .dir) {
                 ctx.note(if (opts.dry_run) fmt(ctx, "  would remove {s}/", .{skill}) else fmt(ctx, "  removed {s}", .{skill}));
             }
-            if (pathExists(soul)) {
+            if (common.isRegularFileNoSymlink(io, soul)) {
                 ctx.note(if (opts.dry_run) fmt(ctx, "  would strip caveman block from {s}", .{soul}) else fmt(ctx, "  stripped caveman block from {s}", .{soul}));
             }
-            openclaw.uninstallOpenclaw(gpa, ws, opts.dry_run) catch {};
+            openclaw.uninstallOpenclaw(io, gpa, ws, opts.dry_run) catch {};
             ctx.ok("  pruned caveman entries from OpenClaw workspace");
         }
     }
@@ -1735,9 +1834,9 @@ fn uninstall(ctx: *Ctx) void {
             break :blk nullclaw.resolveWorkspace(gpa) catch "";
         };
         const skill = std.fs.path.join(gpa, &.{ ws, "skills", "caveman" }) catch "";
-        if (pathExists(skill)) {
+        if (common.classify(io, skill) == .dir) {
             ctx.note(if (opts.dry_run) fmt(ctx, "  would remove {s}/", .{skill}) else fmt(ctx, "  removed {s}", .{skill}));
-            nullclaw.uninstallNullclaw(gpa, ws, opts.dry_run) catch {};
+            nullclaw.uninstallNullclaw(io, gpa, ws, opts.dry_run) catch {};
             ctx.ok("  pruned caveman skill from NullClaw workspace");
         }
     }
@@ -1745,7 +1844,7 @@ fn uninstall(ctx: *Ctx) void {
     // Flag file.
     {
         const flag = std.fs.path.join(gpa, &.{ ctx.config_dir, ".caveman-active" }) catch "";
-        if (pathExists(flag) and !opts.dry_run) {
+        if (pathExists(io, flag) and !opts.dry_run) {
             var b: [std.fs.max_path_bytes]u8 = undefined;
             if (common.toZ(&b, flag)) |z| _ = c.unlink(z) else |_| {}
         }
@@ -1759,14 +1858,16 @@ fn uninstall(ctx: *Ctx) void {
 
 fn uninstallOpencode(ctx: *Ctx) void {
     const gpa = ctx.gpa;
+    const io = ctx.io;
     const opts = ctx.opts;
     const dir = opencodeConfigDir(gpa);
     const plugin_dir = std.fs.path.join(gpa, &.{ dir, "plugins", "caveman" }) catch return;
-    if (!pathExists(plugin_dir)) return;
+    const plugin_kind = common.classify(io, plugin_dir);
+    if (plugin_kind == .missing) return;
 
     const oc_json = std.fs.path.join(gpa, &.{ dir, "opencode.json" }) catch return;
-    if (isFileReal(oc_json)) {
-        if (readSettingsDoc(gpa, oc_json)) |doc_const| {
+    if (isFileReal(io, oc_json)) {
+        if (readSettingsDoc(io, gpa, oc_json)) |doc_const| {
             var doc = doc_const;
             defer doc.deinit();
             if (doc.value == .object) {
@@ -1791,36 +1892,40 @@ fn uninstallOpencode(ctx: *Ctx) void {
                     }
                 }
             }
-            if (!opts.dry_run) writeSettingsFile(gpa, oc_json, doc.value) catch {};
+            if (!opts.dry_run) writeSettingsFile(io, gpa, oc_json, doc.value) catch {};
             ctx.ok(fmt(ctx, "  pruned caveman entries from {s}", .{oc_json}));
         }
     }
-    if (!opts.dry_run) openclaw.removeTree(gpa, plugin_dir);
-    ctx.note(fmt(ctx, "  removed {s}", .{plugin_dir}));
+    if (plugin_kind == .symlink) {
+        ctx.warn(fmt(ctx, "  left symlinked opencode plugin dir in place: {s}", .{plugin_dir}));
+    } else {
+        if (!opts.dry_run) openclaw.removeTree(io, gpa, plugin_dir);
+        ctx.note(fmt(ctx, "  removed {s}", .{plugin_dir}));
+    }
 
     for (OPENCODE_COMMAND_FILES) |f| {
         const p = std.fs.path.join(gpa, &.{ dir, "commands", f }) catch continue;
-        if (pathExists(p) and !opts.dry_run) {
+        if (pathExists(io, p) and !opts.dry_run) {
             var b: [std.fs.max_path_bytes]u8 = undefined;
             if (common.toZ(&b, p)) |z| _ = c.unlink(z) else |_| {}
         }
     }
     for (OPENCODE_AGENT_FILES) |f| {
         const p = std.fs.path.join(gpa, &.{ dir, "agents", f }) catch continue;
-        if (pathExists(p) and !opts.dry_run) {
+        if (pathExists(io, p) and !opts.dry_run) {
             var b: [std.fs.max_path_bytes]u8 = undefined;
             if (common.toZ(&b, p)) |z| _ = c.unlink(z) else |_| {}
         }
     }
     for (OPENCODE_SKILL_DIRS) |name| {
         const p = std.fs.path.join(gpa, &.{ dir, "skills", name }) catch continue;
-        if (pathExists(p) and !opts.dry_run) openclaw.removeTree(gpa, p);
+        if (common.classify(io, p) != .missing and !opts.dry_run) openclaw.removeTree(io, gpa, p);
     }
 
     // AGENTS.md fenced-block strip.
     const oc_agents = std.fs.path.join(gpa, &.{ dir, "AGENTS.md" }) catch return;
-    if (isFileReal(oc_agents)) {
-        const body = common.readFileAlloc(gpa, oc_agents, 4 * 1024 * 1024) orelse return;
+    if (common.isRegularFileNoSymlink(io, oc_agents)) {
+        const body = common.readFileAlloc(io, gpa, oc_agents, 4 * 1024 * 1024) orelse return;
         const begin = std.mem.indexOf(u8, body, OPENCODE_AGENTS_MD_BEGIN);
         const end = std.mem.indexOf(u8, body, OPENCODE_AGENTS_MD_END);
         if (begin != null and end != null and end.? > begin.?) {
@@ -1840,7 +1945,7 @@ fn uninstallOpencode(ctx: *Ctx) void {
                     var b: [std.fs.max_path_bytes]u8 = undefined;
                     if (common.toZ(&b, oc_agents)) |z| _ = c.unlink(z) else |_| {}
                 } else {
-                    writeFile0644(oc_agents, next) catch {};
+                    writeFile0644(io, oc_agents, next) catch {};
                 }
             }
             ctx.note(if (next.len == 0) fmt(ctx, "  removed {s}", .{oc_agents}) else fmt(ctx, "  stripped caveman block from {s}", .{oc_agents}));
@@ -1860,7 +1965,7 @@ fn uninstallOpencode(ctx: *Ctx) void {
 
     // opencode flag file.
     const oc_flag = std.fs.path.join(gpa, &.{ dir, ".caveman-active" }) catch return;
-    if (pathExists(oc_flag) and !opts.dry_run) {
+    if (pathExists(io, oc_flag) and !opts.dry_run) {
         var b: [std.fs.max_path_bytes]u8 = undefined;
         if (common.toZ(&b, oc_flag)) |z| _ = c.unlink(z) else |_| {}
     }
@@ -1908,11 +2013,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer arena_state.deinit();
     const gpa = arena_state.allocator();
 
+    // Construct the std.Io backend once; thread it down to every FS fn.
+    var threaded = common.threaded();
+    defer threaded.deinit();
+    const io = threaded.io();
+
     var argv: std.ArrayList([]const u8) = .empty;
+    var argv0: []const u8 = "";
     {
         var it = init.args.iterate();
         defer it.deinit();
-        _ = it.skip();
+        if (it.next()) |a0| argv0 = gpa.dupe(u8, a0) catch "";
         while (it.next()) |a| argv.append(gpa, gpa.dupe(u8, a) catch continue) catch {};
     }
 
@@ -1932,14 +2043,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const home = common.getenv("HOME") orelse break :blk "";
         break :blk std.fs.path.join(gpa, &.{ home, ".claude" }) catch "";
     };
-    const repo_root = detectRepoRoot(gpa);
+    const repo_root = detectRepoRoot(io, gpa);
+    const self_bin_dir = selfBinDirFromArgv0(io, gpa, argv0);
 
     var results: Results = .{};
     var ctx: Ctx = .{
         .gpa = gpa,
+        .io = io,
         .opts = &opts,
         .config_dir = config_dir,
         .repo_root = repo_root,
+        .self_bin_dir = self_bin_dir,
         .results = &results,
         .color = makeChalk(opts.no_color),
     };
@@ -1958,7 +2072,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     for (PROVIDERS) |prov| {
         if (!want(&opts, prov.id)) continue;
         if (prov.soft and !explicit(&opts, prov.id)) continue;
-        if (!explicit(&opts, prov.id) and !detectMatch(gpa, prov.detect)) continue;
+        if (!explicit(&opts, prov.id) and !detectMatch(io, gpa, prov.detect)) continue;
 
         if (std.mem.eql(u8, prov.id, "claude")) {
             installClaude(&ctx);
@@ -1992,7 +2106,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (runInit(&ctx)) {
             pushInstalled(&ctx, fmt(&ctx, "caveman-init ({s})", .{cwd}));
         } else {
-            pushFailed(&ctx, "caveman-init", "src/tools/caveman-init.js failed");
+            pushFailed(&ctx, "caveman-init", "caveman-init binary failed");
         }
         out("\n");
     } else if (results.installed.items.len > 0 or results.skipped.items.len > 0) {
@@ -2134,40 +2248,96 @@ test "detectMatch dir clause + || alternation" {
     // shellEscape, path joins) into the caller's arena and never frees per-call,
     // so it's exercised with an arena here rather than the leak-checking
     // testing.allocator.
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
 
     // dir: clause hits an existing directory.
     const spec_dir = try std.fmt.allocPrint(gpa, "dir:{s}", .{dir_path});
-    try testing.expect(detectMatch(gpa, spec_dir));
+    try testing.expect(detectMatch(io, gpa, spec_dir));
 
     // Missing dir → false.
     const spec_missing = try std.fmt.allocPrint(gpa, "dir:{s}/does-not-exist", .{dir_path});
-    try testing.expect(!detectMatch(gpa, spec_missing));
+    try testing.expect(!detectMatch(io, gpa, spec_missing));
 
     // || alternation: first clause misses, second hits.
     const spec_alt = try std.fmt.allocPrint(gpa, "dir:{s}/nope||dir:{s}", .{ dir_path, dir_path });
-    try testing.expect(detectMatch(gpa, spec_alt));
+    try testing.expect(detectMatch(io, gpa, spec_alt));
 
     // command: clause for a binary that exists (sh is always present).
-    try testing.expect(detectMatch(gpa, "command:sh"));
-    try testing.expect(!detectMatch(gpa, "command:definitely-not-a-real-binary-xyz"));
+    try testing.expect(detectMatch(io, gpa, "command:sh"));
+    try testing.expect(!detectMatch(io, gpa, "command:definitely-not-a-real-binary-xyz"));
 }
 
 test "detectMatch file clause" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const gpa = arena.allocator();
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     const f = try std.fs.path.join(gpa, &.{ dir_path, "marker" });
-    try common.writeSmall(f, "x");
+    try common.writeSmall(io, f, "x");
     const spec = try std.fmt.allocPrint(gpa, "file:{s}", .{f});
-    try testing.expect(detectMatch(gpa, spec));
+    try testing.expect(detectMatch(io, gpa, spec));
     // dir: on a regular file → false (isDirReal).
     const spec_dir = try std.fmt.allocPrint(gpa, "dir:{s}", .{f});
-    try testing.expect(!detectMatch(gpa, spec_dir));
+    try testing.expect(!detectMatch(io, gpa, spec_dir));
+}
+
+test "writeFile0644 refuses symlinked target" {
+    if (is_windows) return error.SkipZigTest;
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
+    const gpa = testing.allocator;
+    const dir_path = try common.makeTmpDir(io, gpa);
+    defer gpa.free(dir_path);
+
+    const victim = try std.fs.path.join(gpa, &.{ dir_path, "victim.txt" });
+    defer gpa.free(victim);
+    const link = try std.fs.path.join(gpa, &.{ dir_path, "link.txt" });
+    defer gpa.free(link);
+    try common.writeSmall(io, victim, "keep\n");
+
+    std.Io.Dir.cwd().symLink(io, victim, link, .{}) catch return error.SkipZigTest;
+
+    try testing.expectError(error.SymlinkRefused, writeFile0644(io, link, "replace\n"));
+    const data = try common.readSmall(io, gpa, victim);
+    defer gpa.free(data);
+    try testing.expectEqualStrings("keep\n", data);
+
+    common.unlinkFlag(io, link);
+    common.unlinkFlag(io, victim);
+}
+
+test "writeFile0644 refuses symlinked parent" {
+    if (is_windows) return error.SkipZigTest;
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
+    const gpa = testing.allocator;
+    const dir_path = try common.makeTmpDir(io, gpa);
+    defer gpa.free(dir_path);
+
+    const outside = try std.fs.path.join(gpa, &.{ dir_path, "outside" });
+    defer gpa.free(outside);
+    try common.mkdirPath(io, outside);
+    const link_parent = try std.fs.path.join(gpa, &.{ dir_path, "linked-parent" });
+    defer gpa.free(link_parent);
+    std.Io.Dir.cwd().symLink(io, outside, link_parent, .{}) catch return error.SkipZigTest;
+
+    const target = try std.fs.path.join(gpa, &.{ link_parent, "payload.txt" });
+    defer gpa.free(target);
+    try testing.expectError(error.ParentSymlinkRefused, writeFile0644(io, target, "nope\n"));
+
+    common.unlinkFlag(io, link_parent);
+    std.Io.Dir.cwd().deleteDir(io, outside) catch {};
 }
 
 test "joinTokens collapses whitespace runs" {

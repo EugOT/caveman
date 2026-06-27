@@ -22,6 +22,7 @@
 //! exactly.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const common = @import("common.zig");
 const c = std.c;
 
@@ -271,12 +272,16 @@ pub const SoulResult = struct {
 /// logic (`endsWith("\n\n") ? "" : endsWith("\n") ? "\n" : "\n\n"`). All writes
 /// go through common.safeWriteFlag. `root` is the workspace dir, used for the
 /// ancestor-symlink anchor.
-pub fn appendBootstrapToSoul(gpa: std.mem.Allocator, soul_path: []const u8, snippet: []const u8) Error!SoulResult {
-    if (common.isSymlink(soul_path)) return .{ .changed = false, .skipped = true };
+pub fn appendBootstrapToSoul(io: std.Io, gpa: std.mem.Allocator, soul_path: []const u8, snippet: []const u8) Error!SoulResult {
+    if (common.isSymlink(io, soul_path)) return .{ .changed = false, .skipped = true };
     const dir = std.fs.path.dirname(soul_path) orelse ".";
-    if (common.ancestorUnsafe(dir)) return .{ .changed = false, .skipped = true };
+    if (common.ancestorUnsafe(io, dir)) return .{ .changed = false, .skipped = true };
 
-    const existing = common.readFileAlloc(gpa, soul_path, 4 * 1024 * 1024);
+    const existing: ?[]u8 = if (common.existsNoFollow(io, soul_path)) blk: {
+        if (!common.isRegularFileNoSymlink(io, soul_path)) return .{ .changed = false, .skipped = true };
+        break :blk common.readFileAlloc(io, gpa, soul_path, 4 * 1024 * 1024) orelse
+            return .{ .changed = false, .skipped = true };
+    } else null;
     defer if (existing) |e| gpa.free(e);
 
     if (existing) |e| {
@@ -305,7 +310,7 @@ pub fn appendBootstrapToSoul(gpa: std.mem.Allocator, soul_path: []const u8, snip
         try next.appendSlice(gpa, snippet);
     }
 
-    common.safeWriteFlag(gpa, soul_path, next.items) catch return .{ .changed = false, .skipped = true };
+    common.safeWriteFlag(io, gpa, soul_path, next.items) catch return .{ .changed = false, .skipped = true };
     return .{ .changed = true };
 }
 
@@ -313,13 +318,16 @@ pub fn appendBootstrapToSoul(gpa: std.mem.Allocator, soul_path: []const u8, snip
 /// blank lines around the cut. If SOUL.md only contained our block, the file is
 /// unlinked. Mirrors the `before.replace(/\n+$/, '\n') + after.replace(/^\n+/,
 /// '\n')`.trimEnd() reconstruction, then `+ '\n'` when non-empty.
-pub fn stripBootstrapFromSoul(gpa: std.mem.Allocator, soul_path: []const u8) Error!SoulResult {
-    if (common.isSymlink(soul_path)) return .{ .changed = false, .skipped = true };
+pub fn stripBootstrapFromSoul(io: std.Io, gpa: std.mem.Allocator, soul_path: []const u8) Error!SoulResult {
+    if (common.isSymlink(io, soul_path)) return .{ .changed = false, .skipped = true };
     const dir = std.fs.path.dirname(soul_path) orelse ".";
-    if (common.ancestorUnsafe(dir)) return .{ .changed = false, .skipped = true };
+    if (common.ancestorUnsafe(io, dir)) return .{ .changed = false, .skipped = true };
 
-    const existing = common.readFileAlloc(gpa, soul_path, 4 * 1024 * 1024) orelse
-        return .{ .changed = false };
+    if (common.existsNoFollow(io, soul_path) and !common.isRegularFileNoSymlink(io, soul_path)) {
+        return .{ .changed = false, .skipped = true };
+    }
+    const existing = common.readFileAlloc(io, gpa, soul_path, 4 * 1024 * 1024) orelse
+        return .{ .changed = false, .skipped = true };
     defer gpa.free(existing);
 
     const begin = std.mem.indexOf(u8, existing, MARK_BEGIN) orelse return .{ .changed = false };
@@ -344,10 +352,7 @@ pub fn stripBootstrapFromSoul(gpa: std.mem.Allocator, soul_path: []const u8) Err
 
     if (trimmed.len == 0) {
         // SOUL.md only contained our block — remove the file.
-        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-        if (common.toZ(&pbuf, soul_path)) |pz| {
-            _ = c.unlink(pz);
-        } else |_| {}
+        common.unlinkFlag(io, soul_path);
         return .{ .changed = true, .removed = true };
     }
 
@@ -356,7 +361,7 @@ pub fn stripBootstrapFromSoul(gpa: std.mem.Allocator, soul_path: []const u8) Err
     try final.appendSlice(gpa, trimmed);
     try final.append(gpa, '\n');
 
-    common.safeWriteFlag(gpa, soul_path, final.items) catch return .{ .changed = false, .skipped = true };
+    common.safeWriteFlag(io, gpa, soul_path, final.items) catch return .{ .changed = false, .skipped = true };
     return .{ .changed = true };
 }
 
@@ -392,6 +397,7 @@ pub const InstallResult = struct {
 ///   - `force`: when true, mkdir the workspace if missing.
 /// Mirrors installOpenclaw's ordering, safety checks, and return reasons.
 pub fn installOpenclaw(
+    io: std.Io,
     gpa: std.mem.Allocator,
     workspace: []const u8,
     skill_body: []const u8,
@@ -399,11 +405,13 @@ pub fn installOpenclaw(
     dry_run: bool,
     force: bool,
 ) !InstallResult {
-    // Workspace existence + force-mkdir.
-    if (common.classify(workspace) == .missing) {
+    // Workspace existence + force-mkdir. Classify once: avoids 4 redundant lstat
+    // syscalls and takes a single atomic snapshot (no re-stat across the checks).
+    const ws_kind = common.classify(io, workspace);
+    if (ws_kind == .missing) {
         if (!force) return .{ .ok = false, .reason = "workspace missing" };
-        if (!dry_run) mkdirP(workspace);
-    } else if (common.classify(workspace) == .symlink or common.classify(workspace) == .other) {
+        if (!dry_run and !mkdirP(io, workspace)) return .{ .ok = false, .reason = "unsafe target" };
+    } else if (ws_kind == .symlink or ws_kind == .other) {
         return .{ .ok = false, .reason = "unsafe target" };
     }
 
@@ -415,19 +423,19 @@ pub fn installOpenclaw(
     defer gpa.free(soul_file);
 
     // Safety: refuse symlinked skill file / soul file / parents under workspace.
-    if (common.isSymlink(skill_file)) return .{ .ok = false, .reason = "unsafe target" };
-    if (common.isSymlink(soul_file)) return .{ .ok = false, .reason = "unsafe target" };
+    if (common.isSymlink(io, skill_file)) return .{ .ok = false, .reason = "unsafe target" };
+    if (common.isSymlink(io, soul_file)) return .{ .ok = false, .reason = "unsafe target" };
     {
         const sd = std.fs.path.dirname(skill_file) orelse skill_dir;
-        if (common.ancestorUnsafe(sd)) return .{ .ok = false, .reason = "unsafe target" };
+        if (common.ancestorUnsafe(io, sd)) return .{ .ok = false, .reason = "unsafe target" };
     }
     // skill_dir must not itself be a symlink if it exists.
-    if (common.classify(skill_dir) == .symlink) return .{ .ok = false, .reason = "unsafe target" };
+    if (common.classify(io, skill_dir) == .symlink) return .{ .ok = false, .reason = "unsafe target" };
     // the `skills` parent dir must not be a symlink either.
     {
         const skills_parent = try std.fs.path.join(gpa, &.{ workspace, "skills" });
         defer gpa.free(skills_parent);
-        if (common.classify(skills_parent) == .symlink) return .{ .ok = false, .reason = "unsafe target" };
+        if (common.classify(io, skills_parent) == .symlink) return .{ .ok = false, .reason = "unsafe target" };
     }
 
     if (dry_run) return .{ .ok = true };
@@ -435,37 +443,38 @@ pub fn installOpenclaw(
     // common.safeWriteFlag only mkdirs the immediate parent; the skill lives two
     // levels under the workspace (skills/caveman/), so create the tree first
     // (mirrors writeFileSafe's fs.mkdirSync(dirname, {recursive:true})).
-    mkdirP(skill_dir);
+    if (!mkdirP(io, skill_dir)) return .{ .ok = false, .reason = "unsafe target" };
 
     const merged = try mergeOpenclawFrontmatter(gpa, skill_body);
     defer gpa.free(merged);
-    common.safeWriteFlag(gpa, skill_file, merged) catch return .{ .ok = false, .reason = "unsafe target" };
+    common.safeWriteFlag(io, gpa, skill_file, merged) catch return .{ .ok = false, .reason = "unsafe target" };
 
-    const soul = try appendBootstrapToSoul(gpa, soul_file, snippet);
+    const soul = try appendBootstrapToSoul(io, gpa, soul_file, snippet);
     if (soul.skipped) return .{ .ok = false, .reason = "unsafe target" };
 
     return .{ .ok = true };
 }
 
 /// Uninstall: remove the skill folder and strip the SOUL.md block.
-pub fn uninstallOpenclaw(gpa: std.mem.Allocator, workspace: []const u8, dry_run: bool) !void {
+pub fn uninstallOpenclaw(io: std.Io, gpa: std.mem.Allocator, workspace: []const u8, dry_run: bool) !void {
     const skill_dir = try std.fs.path.join(gpa, &.{ workspace, "skills", SKILL_NAME });
     defer gpa.free(skill_dir);
     const soul_file = try std.fs.path.join(gpa, &.{ workspace, SOUL_FILE });
     defer gpa.free(soul_file);
 
-    if (common.classify(skill_dir) != .missing and !dry_run) {
-        removeTree(gpa, skill_dir);
+    if (common.classify(io, skill_dir) == .dir and !dry_run) {
+        removeTree(io, gpa, skill_dir);
     }
-    if (common.classify(soul_file) != .missing and !dry_run) {
-        _ = stripBootstrapFromSoul(gpa, soul_file) catch {};
+    if (common.isRegularFileNoSymlink(io, soul_file) and !dry_run) {
+        _ = stripBootstrapFromSoul(io, gpa, soul_file) catch {};
     }
 }
 
 // ── Filesystem helpers (libc) ───────────────────────────────────────────────
-fn mkdirP(dir: []const u8) void {
+fn mkdirP(io: std.Io, dir: []const u8) bool {
+    if (common.ancestorUnsafe(io, dir)) return false;
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (dir.len >= buf.len) return;
+    if (dir.len >= buf.len) return false;
     var i: usize = 0;
     while (i < dir.len) {
         var j = i;
@@ -478,13 +487,27 @@ fn mkdirP(dir: []const u8) void {
         }
         i = j + 1;
     }
+    return common.classify(io, dir) == .dir;
 }
 
 /// Recursive directory removal (rmSync({recursive,force}) analogue). Best-effort.
-/// libc opendir/readdir/closedir + per-entry lstat classification — stays on the
-/// stable C ABI like the rest of the hook tree (std.fs.cwd() is gone in this
-/// 0.16 build). Shared by openclaw + nullclaw uninstall.
-pub fn removeTree(gpa: std.mem.Allocator, path: []const u8) void {
+/// libc opendir/readdir/closedir for traversal + std.Io classify per entry — the
+/// directory-iteration libc calls (opendir/readdir/unlink/rmdir) carry no struct
+/// layout that breaks cross-compile, so they stay; only the lstat classification
+/// moved to std.Io. Shared by openclaw + nullclaw uninstall.
+pub fn removeTree(io: std.Io, gpa: std.mem.Allocator, path: []const u8) void {
+    switch (common.classify(io, path)) {
+        .missing, .symlink => return,
+        .other => {
+            var fbuf: [std.fs.max_path_bytes]u8 = undefined;
+            if (common.toZ(&fbuf, path)) |fz| {
+                _ = c.unlink(fz);
+            } else |_| {}
+            return;
+        },
+        .dir => {},
+    }
+
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const pz = common.toZ(&pbuf, path) catch return;
 
@@ -500,8 +523,8 @@ pub fn removeTree(gpa: std.mem.Allocator, path: []const u8) void {
             if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) continue;
             const child = std.fs.path.join(gpa, &.{ path, name }) catch continue;
             defer gpa.free(child);
-            switch (common.classify(child)) {
-                .dir => removeTree(gpa, child),
+            switch (common.classify(io, child)) {
+                .dir => removeTree(io, gpa, child),
                 else => {
                     var cbuf: [std.fs.max_path_bytes]u8 = undefined;
                     if (common.toZ(&cbuf, child)) |cz| {
@@ -633,67 +656,76 @@ test "loadBootstrapSnippet normalizes trailing newline from repo body" {
 }
 
 test "SOUL append/strip round-trip preserves user content" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
 
     const soul = try std.fs.path.join(gpa, &.{ dir_path, "SOUL.md" });
     defer gpa.free(soul);
 
     const user = "# my workspace\n\nfoo bar baz\n";
-    try common.writeSmall(soul, user);
+    try common.writeSmall(io, soul, user);
 
     // append
-    const r1 = try appendBootstrapToSoul(gpa, soul, BOOTSTRAP_SNIPPET);
+    const r1 = try appendBootstrapToSoul(io, gpa, soul, BOOTSTRAP_SNIPPET);
     try testing.expect(r1.changed);
-    const after_append = common.readFileAlloc(gpa, soul, 1 << 20).?;
+    const after_append = common.readFileAlloc(io, gpa, soul, 1 << 20).?;
     defer gpa.free(after_append);
     try testing.expect(std.mem.indexOf(u8, after_append, "# my workspace") != null);
     try testing.expect(std.mem.indexOf(u8, after_append, MARK_BEGIN) != null);
     try testing.expect(std.mem.indexOf(u8, after_append, SENTINEL) != null);
 
     // idempotent append
-    const r2 = try appendBootstrapToSoul(gpa, soul, BOOTSTRAP_SNIPPET);
+    const r2 = try appendBootstrapToSoul(io, gpa, soul, BOOTSTRAP_SNIPPET);
     try testing.expect(!r2.changed);
-    const after_append2 = common.readFileAlloc(gpa, soul, 1 << 20).?;
+    const after_append2 = common.readFileAlloc(io, gpa, soul, 1 << 20).?;
     defer gpa.free(after_append2);
     try testing.expectEqual(@as(usize, 1), countOccurrences(after_append2, MARK_BEGIN));
 
     // strip — user content restored, block gone
-    const r3 = try stripBootstrapFromSoul(gpa, soul);
+    const r3 = try stripBootstrapFromSoul(io, gpa, soul);
     try testing.expect(r3.changed);
     try testing.expect(!r3.removed);
-    const after_strip = common.readFileAlloc(gpa, soul, 1 << 20).?;
+    const after_strip = common.readFileAlloc(io, gpa, soul, 1 << 20).?;
     defer gpa.free(after_strip);
     try testing.expect(std.mem.indexOf(u8, after_strip, "# my workspace") != null);
     try testing.expect(std.mem.indexOf(u8, after_strip, "foo bar baz") != null);
     try testing.expect(std.mem.indexOf(u8, after_strip, MARK_BEGIN) == null);
 
-    var fb: [std.fs.max_path_bytes]u8 = undefined;
-    _ = c.unlink(try common.toZ(&fb, soul));
+    common.unlinkFlag(io, soul);
 }
 
 test "SOUL strip removes file when only our block present" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
 
     const soul = try std.fs.path.join(gpa, &.{ dir_path, "SOUL.md" });
     defer gpa.free(soul);
 
     // create SOUL.md with only the bootstrap block
-    const r0 = try appendBootstrapToSoul(gpa, soul, BOOTSTRAP_SNIPPET);
+    const r0 = try appendBootstrapToSoul(io, gpa, soul, BOOTSTRAP_SNIPPET);
     try testing.expect(r0.changed);
 
-    const r1 = try stripBootstrapFromSoul(gpa, soul);
+    const r1 = try stripBootstrapFromSoul(io, gpa, soul);
     try testing.expect(r1.changed);
     try testing.expect(r1.removed);
-    try testing.expect(common.classify(soul) == .missing);
+    try testing.expect(common.classify(io, soul) == .missing);
 }
 
 test "appendBootstrapToSoul refuses symlinked target" {
+    if (builtin.os.tag == .windows) return;
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
 
     const victim = try std.fs.path.join(gpa, &.{ dir_path, "victim.md" });
@@ -701,20 +733,77 @@ test "appendBootstrapToSoul refuses symlinked target" {
     const soul = try std.fs.path.join(gpa, &.{ dir_path, "SOUL.md" });
     defer gpa.free(soul);
 
-    try common.writeSmall(victim, "VICTIM\n");
-    var vb: [std.fs.max_path_bytes]u8 = undefined;
-    var sb: [std.fs.max_path_bytes]u8 = undefined;
-    try testing.expect(c.symlink(try common.toZ(&vb, victim), try common.toZ(&sb, soul)) == 0);
+    try common.writeSmall(io, victim, "VICTIM\n");
+    std.Io.Dir.cwd().symLink(io, victim, soul, .{}) catch return error.SkipZigTest;
 
-    const r = try appendBootstrapToSoul(gpa, soul, BOOTSTRAP_SNIPPET);
+    const r = try appendBootstrapToSoul(io, gpa, soul, BOOTSTRAP_SNIPPET);
     try testing.expect(!r.changed);
     try testing.expect(r.skipped);
-    const data = try common.readSmall(gpa, victim);
+    const data = try common.readSmall(io, gpa, victim);
     defer gpa.free(data);
     try testing.expectEqualStrings("VICTIM\n", data);
 
-    _ = c.unlink(try common.toZ(&sb, soul));
-    _ = c.unlink(try common.toZ(&vb, victim));
+    common.unlinkFlag(io, soul);
+    common.unlinkFlag(io, victim);
+}
+
+test "appendBootstrapToSoul skips unreadable oversized existing SOUL" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
+    const gpa = testing.allocator;
+    const dir_path = try common.makeTmpDir(io, gpa);
+    defer gpa.free(dir_path);
+
+    const soul = try std.fs.path.join(gpa, &.{ dir_path, "SOUL.md" });
+    defer gpa.free(soul);
+
+    const big = try gpa.alloc(u8, 4 * 1024 * 1024 + 1);
+    defer gpa.free(big);
+    @memset(big, 'x');
+    try common.safeWriteFlag(io, gpa, soul, big);
+
+    const r = try appendBootstrapToSoul(io, gpa, soul, BOOTSTRAP_SNIPPET);
+    try testing.expect(!r.changed);
+    try testing.expect(r.skipped);
+
+    const first = try common.readSmall(io, gpa, soul);
+    defer gpa.free(first);
+    try testing.expect(first.len > 0);
+    try testing.expect(first[0] == 'x');
+
+    common.unlinkFlag(io, soul);
+}
+
+test "removeTree refuses symlinked root directory" {
+    if (builtin.os.tag == .windows) return;
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
+    const gpa = testing.allocator;
+    const dir_path = try common.makeTmpDir(io, gpa);
+    defer gpa.free(dir_path);
+
+    const victim = try std.fs.path.join(gpa, &.{ dir_path, "victim" });
+    defer gpa.free(victim);
+    try common.mkdirPath(io, victim);
+    const marker = try std.fs.path.join(gpa, &.{ victim, "marker.txt" });
+    defer gpa.free(marker);
+    try common.writeSmall(io, marker, "keep\n");
+
+    const link = try std.fs.path.join(gpa, &.{ dir_path, "link" });
+    defer gpa.free(link);
+    std.Io.Dir.cwd().symLink(io, victim, link, .{}) catch return error.SkipZigTest;
+
+    removeTree(io, gpa, link);
+    try testing.expect(common.classify(io, link) == .symlink);
+    const data = try common.readSmall(io, gpa, marker);
+    defer gpa.free(data);
+    try testing.expectEqualStrings("keep\n", data);
+
+    common.unlinkFlag(io, link);
+    common.unlinkFlag(io, marker);
+    std.Io.Dir.cwd().deleteDir(io, victim) catch {};
 }
 
 test "resolveWorkspace honors OPENCLAW_WORKSPACE" {
@@ -730,57 +819,63 @@ test "resolveWorkspace honors OPENCLAW_WORKSPACE" {
 }
 
 test "installOpenclaw writes skill + SOUL, idempotent" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
     const ws = try std.fs.path.join(gpa, &.{ dir_path, "ws" });
     defer gpa.free(ws);
-    try common.mkdirPath(ws);
+    try common.mkdirPath(io, ws);
 
     const skill_body = "---\ndescription: x\n---\nRespond terse like smart caveman.\n";
 
-    const r1 = try installOpenclaw(gpa, ws, skill_body, BOOTSTRAP_SNIPPET, false, false);
+    const r1 = try installOpenclaw(io, gpa, ws, skill_body, BOOTSTRAP_SNIPPET, false, false);
     try testing.expect(r1.ok);
 
     const skill_file = try std.fs.path.join(gpa, &.{ ws, "skills", "caveman", "SKILL.md" });
     defer gpa.free(skill_file);
-    const skill_raw = common.readFileAlloc(gpa, skill_file, 1 << 20).?;
+    const skill_raw = common.readFileAlloc(io, gpa, skill_file, 1 << 20).?;
     defer gpa.free(skill_raw);
     try testing.expect(std.mem.indexOf(u8, skill_raw, "always: true") != null);
     try testing.expect(std.mem.indexOf(u8, skill_raw, "version: 1.0.0") != null);
 
     const soul_file = try std.fs.path.join(gpa, &.{ ws, "SOUL.md" });
     defer gpa.free(soul_file);
-    const soul_raw = common.readFileAlloc(gpa, soul_file, 1 << 20).?;
+    const soul_raw = common.readFileAlloc(io, gpa, soul_file, 1 << 20).?;
     defer gpa.free(soul_raw);
     try testing.expect(std.mem.indexOf(u8, soul_raw, SENTINEL) != null);
 
     // idempotent re-run: still one always: key, one marker block.
-    const r2 = try installOpenclaw(gpa, ws, skill_body, BOOTSTRAP_SNIPPET, false, false);
+    const r2 = try installOpenclaw(io, gpa, ws, skill_body, BOOTSTRAP_SNIPPET, false, false);
     try testing.expect(r2.ok);
-    const skill_raw2 = common.readFileAlloc(gpa, skill_file, 1 << 20).?;
+    const skill_raw2 = common.readFileAlloc(io, gpa, skill_file, 1 << 20).?;
     defer gpa.free(skill_raw2);
     try testing.expectEqual(@as(usize, 1), countOccurrences(skill_raw2, "always: true"));
-    const soul_raw2 = common.readFileAlloc(gpa, soul_file, 1 << 20).?;
+    const soul_raw2 = common.readFileAlloc(io, gpa, soul_file, 1 << 20).?;
     defer gpa.free(soul_raw2);
     try testing.expectEqual(@as(usize, 1), countOccurrences(soul_raw2, MARK_BEGIN));
 
     // uninstall clears it
-    try uninstallOpenclaw(gpa, ws, false);
+    try uninstallOpenclaw(io, gpa, ws, false);
     const skill_dir = try std.fs.path.join(gpa, &.{ ws, "skills", "caveman" });
     defer gpa.free(skill_dir);
-    try testing.expect(common.classify(skill_dir) == .missing);
+    try testing.expect(common.classify(io, skill_dir) == .missing);
 }
 
 test "installOpenclaw reports workspace missing without force" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = testing.allocator;
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
     const ws = try std.fs.path.join(gpa, &.{ dir_path, "missing-ws" });
     defer gpa.free(ws);
 
     const skill_body = "---\ndescription: x\n---\nbody\n";
-    const r = try installOpenclaw(gpa, ws, skill_body, BOOTSTRAP_SNIPPET, false, false);
+    const r = try installOpenclaw(io, gpa, ws, skill_body, BOOTSTRAP_SNIPPET, false, false);
     try testing.expect(!r.ok);
     try testing.expectEqualStrings("workspace missing", r.reason);
 }

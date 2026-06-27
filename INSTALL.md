@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.
 irm https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.ps1 | iex
 ```
 
-> Piping a script straight into a shell runs it sight-unseen. If you'd rather read it first, download then run: `curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.sh -o install.sh` (review it) `&& bash install.sh`. The installer downloads hook files from a pinned release tag and verifies them against a committed SHA-256 manifest before writing.
+> Piping a script straight into a shell runs it sight-unseen. If you'd rather read it first, download then run: `curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.sh -o install.sh` (review it) `&& bash install.sh`. The installer downloads the prebuilt caveman Zig binaries for your platform from the latest GitHub Release, SHA-256-verifies the archive, and runs `caveman-install` (no Node, no Zig toolchain required).
 
 What it does:
 
@@ -41,14 +41,14 @@ If you want to install for one agent (or want to know exactly what command runs 
 |---|---|:-:|
 | **Claude Code** | `claude plugin marketplace add JuliusBrussee/caveman && claude plugin install caveman@caveman` | Yes |
 | **Gemini CLI** | `gemini extensions install https://github.com/JuliusBrussee/caveman` | Yes |
-| **opencode** | `node bin/install.js --only opencode` *(or `npx -y github:JuliusBrussee/caveman -- --only opencode`)* | Yes (plugin + AGENTS.md) |
-| **OpenClaw** | `npx -y github:JuliusBrussee/caveman -- --only openclaw` | Yes (workspace skill + SOUL.md) |
-| **NullClaw** | `npx -y github:JuliusBrussee/caveman -- --only nullclaw` | Yes (workspace skill with `always: true`) |
+| **opencode** | `caveman --only opencode` *(or `bash install.sh --only opencode`)* | Yes (plugin + AGENTS.md) |
+| **OpenClaw** | `bash install.sh --only openclaw` *(or `curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.sh \| bash -s -- --only openclaw`)* | Yes (workspace skill + SOUL.md) |
+| **NullClaw** | `bash install.sh --only nullclaw` *(or `… \| bash -s -- --only nullclaw`)* | Yes (workspace skill with `always: true`) |
 | **Codex CLI / Codex app** | `npx skills add JuliusBrussee/caveman -a codex` *(aliases: `codex-cli`, `codex-app`)* | Per-session: `/caveman`; add `--with-init` for `AGENTS.md` + `.agents/skills/` + `.codex/skills/` |
 | **Cursor** | `npx skills add JuliusBrussee/caveman -a cursor` | Per-session by default; `--with-init` for an always-on rule file |
 | **Windsurf** | `npx skills add JuliusBrussee/caveman -a windsurf` | Per-session by default; `--with-init` for an always-on rule file |
 | **Cline** | `npx skills add JuliusBrussee/caveman -a cline` | Per-session by default; `--with-init` for an always-on rule file |
-| **GitHub Copilot** *(soft probe)* | `npx -y github:JuliusBrussee/caveman -- --only copilot --with-init` | Repo-wide instructions via `--with-init` |
+| **GitHub Copilot** *(soft probe)* | `bash install.sh --only copilot --with-init` *(or `… \| bash -s -- --only copilot --with-init`)* | Repo-wide instructions via `--with-init` |
 | **Continue** | `npx skills add JuliusBrussee/caveman -a continue` | No — say `/caveman` |
 | **Kilo Code** | `npx skills add JuliusBrussee/caveman -a kilo` | No |
 | **Roo Code** | `npx skills add JuliusBrussee/caveman -a roo` | No |
@@ -70,7 +70,7 @@ If you want to install for one agent (or want to know exactly what command runs 
 | **Tabnine CLI** | `npx skills add JuliusBrussee/caveman -a tabnine-cli` | No |
 | **Trae** | `npx skills add JuliusBrussee/caveman -a trae` | No |
 | **Warp** | `npx skills add JuliusBrussee/caveman -a warp` | No; add `--with-init` for `AGENTS.md` + `.agents/skills/` |
-| **Warp Preview** | `node bin/install.js --only warpPreview` *(alias of `warp`)* | No; add `--with-init` for `AGENTS.md` + `.agents/skills/` |
+| **Warp Preview** | `caveman --only warpPreview` *(alias of `warp`)* | No; add `--with-init` for `AGENTS.md` + `.agents/skills/` |
 | **Replit Agent** | `npx skills add JuliusBrussee/caveman -a replit` | No |
 | **JetBrains Junie** *(soft probe)* | `npx skills add JuliusBrussee/caveman -a junie` | No |
 | **Qoder** *(soft probe)* | `npx skills add JuliusBrussee/caveman -a qoder` | No |
@@ -85,15 +85,15 @@ Repo-local init aliases use `--with-init`: `agents`, `claude-desktop`, `perplexi
 **Finding a profile slug for `npx skills add ... -a <profile>`?** Either read the table above, or print the live matrix from the installer:
 
 ```bash
-# Either of these works (install.sh / install.ps1 are thin shims that
-# forward all flags to bin/install.js):
-bash install.sh --list             # macOS / Linux / WSL, from a local clone
-pwsh install.ps1 --list            # Windows / PowerShell, from a local clone
-node bin/install.js --list         # any platform, from a local clone
-npx -y github:JuliusBrussee/caveman -- --list   # no clone needed
+# install.sh downloads (or, in a clone with `zig`, builds) the caveman Zig
+# binaries, then runs `caveman-install`. From a clone you can also build once
+# and call the binary directly:
+bash install.sh --list             # macOS / Linux / WSL — builds/downloads, then lists
+caveman --list                     # once the binary is on PATH (zig/zig-out/bin)
+pwsh install.ps1 --list            # Windows / PowerShell (legacy Node path, pending R6-Windows)
 ```
 
-Each row prints the agent id, profile slug (where applicable), and whether it was auto-detected on your machine. Full agent matrix (with detection rules) is also defined in `bin/install.js` under the `PROVIDERS` array.
+Each row prints the agent id, profile slug (where applicable), and whether it was auto-detected on your machine. Full agent matrix (with detection rules) is defined in `zig/src/install.zig` under the `PROVIDERS` array.
 
 ## Manual install (no `curl | bash`)
 
@@ -104,14 +104,18 @@ If you'd rather see exactly what runs:
 git clone https://github.com/JuliusBrussee/caveman.git
 cd caveman
 
+# Build the binaries once (or let install.sh download them)
+( cd zig && zig build -Dtool=caveman )
+CAVEMAN=zig/zig-out/bin/caveman-install
+
 # Preview every command the installer would run
-node bin/install.js --dry-run --all
+"$CAVEMAN" --dry-run --all
 
 # Inspect the agent matrix
-node bin/install.js --list
+"$CAVEMAN" --list
 
 # Install for everything detected
-node bin/install.js --all
+"$CAVEMAN" --all
 ```
 
 Useful flags:
@@ -123,7 +127,7 @@ Useful flags:
 | `--only <id>` | One agent only. Repeatable: `--only claude --only cursor`. |
 | `--dry-run` | Print every command. Write nothing. |
 | `--with-init` | Drop always-on rule files into the current repo (`.cursor/`, `.windsurf/`, `.clinerules/`, `.github/copilot-instructions.md`, `.opencode/AGENTS.md`, `AGENTS.md`) and, if OpenClaw is on the box, append the bootstrap block to `~/.openclaw/workspace/SOUL.md`. With explicit aliases it also writes the universal `.agents/skills/caveman/SKILL.md` project skill and repo-local compatibility targets such as `CLAUDE.md`, `.codex/skills/`, `.claude/skills/`, `.pi/skills/`, `.pz/skills/`, and `.claw/instructions.md`. |
-| `--with-mcp-shrink="<upstream cmd>"` | Register `caveman-shrink` MCP proxy wrapping the given upstream MCP server. **Off by default.** A value is required — caveman-shrink is a proxy and exits immediately without one. Example: `--with-mcp-shrink="npx @modelcontextprotocol/server-filesystem /tmp"`. The value is split on whitespace; for paths-with-spaces, install via `node bin/install.js` from a clone or edit `~/.claude.json` after a stub install. |
+| `--with-mcp-shrink="<upstream cmd>"` | Register `caveman-shrink` MCP proxy wrapping the given upstream MCP server. **Off by default.** A value is required — caveman-shrink is a proxy and exits immediately without one. Example: `--with-mcp-shrink="npx @modelcontextprotocol/server-filesystem /tmp"`. The value is split on whitespace; for paths-with-spaces, run the `caveman-install` binary directly from a clone or edit `~/.claude.json` after a stub install. |
 | `--no-mcp-shrink` | Skip MCP-shrink registration. (Default.) |
 | `--with-hooks` / `--no-hooks` | Force-on or force-off the Claude Code hook installer. (Default: on.) |
 | `--skip-skills` | Don't run the npx-skills auto-detect fallback when nothing else matched. |
@@ -141,8 +145,8 @@ NullClaw workspace resolution is `NULLCLAW_WORKSPACE` first. If that is unset, `
 For agents without a hook system (Cursor, Windsurf, Cline, Copilot, and friends), the always-on path is a static rule file. Two ways:
 
 ```bash
-# Drop rule files into the current repo
-node bin/install.js --with-init
+# Drop rule files into the current repo (caveman-init binary)
+caveman --with-init
 
 # Or pull the rule body straight in (manual)
 curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/src/rules/caveman-activate.md \
@@ -154,12 +158,12 @@ curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/src/rule
 For explicit harness aliases, scope the write:
 
 ```bash
-node bin/install.js --with-init --only pi
-node bin/install.js --with-init --only pz
-node bin/install.js --with-init --only walcode   # also works for walkode/claw
-node bin/install.js --with-init --only claude-desktop
-node bin/install.js --with-init --only agents     # universal AGENTS.md/.agents skill only
-node bin/install.js --with-init --only perplexity # universal AGENTS.md/.agents skill only
+caveman --with-init --only pi
+caveman --with-init --only pz
+caveman --with-init --only walcode   # also works for walkode/claw
+caveman --with-init --only claude-desktop
+caveman --with-init --only agents     # universal AGENTS.md/.agents skill only
+caveman --with-init --only perplexity # universal AGENTS.md/.agents skill only
 ```
 
 ## Verify
@@ -169,7 +173,7 @@ After install, three quick checks:
 **1. See what got installed.**
 
 ```bash
-node bin/install.js --list
+caveman --list
 ```
 
 You should see ~30 rows. Detected agents are marked. Anything you wanted but isn't marked → not detected (likely the binary isn't on `PATH`).
@@ -192,13 +196,15 @@ Statusline should show `[CAVEMAN]` (orange) at the bottom of Claude Code. After 
 ## Uninstall
 
 ```bash
-npx -y github:JuliusBrussee/caveman -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/JuliusBrussee/caveman/main/install.sh | bash -s -- --uninstall
+# or, from a clone:
+bash install.sh --uninstall
 ```
 
 What it removes:
 
 - Caveman hook entries from `$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude/`; matched by the substring `caveman`).
-- Hook files in `$CLAUDE_CONFIG_DIR/hooks/` (`caveman-activate.js`, `caveman-mode-tracker.js`, `caveman-stats.js`, `caveman-config.js`, `caveman-statusline.{sh,ps1}`, plus the dir's `package.json` marker).
+- Hook binaries in `$CLAUDE_CONFIG_DIR/hooks/` (`caveman-activate`, `caveman-hook`, `caveman-statusline`, `caveman-stats`).
 - The Claude Code plugin and the Gemini CLI extension (if installed).
 - The opencode native plugin (`~/.config/opencode/plugins/caveman/`, the `plugin` and `mcp.caveman-shrink` entries from `opencode.json`, our skill/agent/command files, the caveman block from `AGENTS.md`, and the opencode flag file).
 - The OpenClaw workspace skill folder and the marker-fenced block from `~/.openclaw/workspace/SOUL.md` (when present).
@@ -224,9 +230,9 @@ Still broken? [Open an issue](https://github.com/JuliusBrussee/caveman/issues).
 
 **"I ran the installer but Claude Code isn't talking caveman."**
 
-1. Run `node bin/install.js --list` — confirm `claude` is on the detected list. If not, `claude` isn't on `PATH`. Fix that first.
-2. Open `$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude/settings.json`) and look for `"hooks"` containing `caveman-activate.js` and `caveman-mode-tracker.js`. If missing, re-run with `--force`.
-3. Check `$CLAUDE_CONFIG_DIR/.caveman-active` exists with content `full`. If not, the SessionStart hook silent-failed — check `$CLAUDE_CONFIG_DIR/hooks/` for the JS files and try `node $CLAUDE_CONFIG_DIR/hooks/caveman-activate.js < /dev/null` to see if it errors.
+1. Run `caveman --list` — confirm `claude` is on the detected list. If not, `claude` isn't on `PATH`. Fix that first.
+2. Open `$CLAUDE_CONFIG_DIR/settings.json` (default `~/.claude/settings.json`) and look for `"hooks"` referencing `caveman-activate` and `caveman-hook`. If missing, re-run with `--force`.
+3. Check `$CLAUDE_CONFIG_DIR/.caveman-active` exists with content `full`. If not, the SessionStart hook silent-failed — check `$CLAUDE_CONFIG_DIR/hooks/` for the `caveman-activate` binary and run `$CLAUDE_CONFIG_DIR/hooks/caveman-activate < /dev/null` to see if it errors.
 4. Restart Claude Code. The SessionStart hook only fires on session start, not mid-session.
 
 **"Hooks failing on Windows."**
@@ -238,7 +244,7 @@ Still broken? [Open an issue](https://github.com/JuliusBrussee/caveman/issues).
 
 **"My `settings.json` got mangled."**
 
-The installer uses a JSONC-tolerant parser (`bin/lib/settings.js`) so comments and trailing commas don't crash the merge. It also runs `validateHookFields()` before every write so a malformed hook can't poison the file. If something still went wrong:
+The installer merges `settings.json` through the `caveman-settings` binary (`zig/src/settings.zig`), a JSONC-tolerant parser so comments and trailing commas don't crash the merge. It also validates hook fields before every write so a malformed hook can't poison the file. If something still went wrong:
 
 1. Check for a backup at `$CLAUDE_CONFIG_DIR/settings.json.bak` (installer writes one before any merge).
 2. If no backup, restore from your shell history or version control.
@@ -250,10 +256,10 @@ Use the rule-file-only path. Hooks are Claude Code-specific; everything else wor
 
 ```bash
 # Just install for one agent, no Claude hooks
-node bin/install.js --only cursor
+caveman --only cursor
 
 # Or write rule files into the current repo only (no global state)
-node bin/install.js --with-init --only cursor --only windsurf
+caveman --with-init --only cursor --only windsurf
 ```
 
 This drops `.cursor/rules/caveman.mdc` (and friends) into your repo. No hooks, no global config, nothing outside the repo.
@@ -272,7 +278,7 @@ The installer doesn't phone home. It writes to:
 - `~/.openclaw/workspace/` (only with `--only openclaw` or `--with-init` when OpenClaw is detected) — the one `--with-init` side-effect outside the cwd.
 - `~/.nullclaw/workspace/`, `$NULLCLAW_HOME/workspace/`, or `$NULLCLAW_WORKSPACE/` (only with `--only nullclaw`; `NULLCLAW_WORKSPACE` wins over `NULLCLAW_HOME`) — NullClaw skill install.
 
-No telemetry. No analytics. The installer's own code makes no network calls. Network requests do happen indirectly through the per-agent CLIs it shells out to — `claude plugin marketplace add`, `claude plugin install`, `gemini extensions install`, `npm view caveman-shrink`, and `npx -y skills add`. Each fetches from its own registry (Anthropic / GitHub / npm). Source: [`bin/install.js`](bin/install.js).
+No telemetry. No analytics. The installer's own code makes no network calls. Network requests do happen indirectly through the per-agent CLIs it shells out to — `claude plugin marketplace add`, `claude plugin install`, `gemini extensions install`, `npm view caveman-shrink`, and `npx -y skills add`. Each fetches from its own registry (Anthropic / GitHub / npm). Source: [`zig/src/install.zig`](zig/src/install.zig).
 
 ---
 

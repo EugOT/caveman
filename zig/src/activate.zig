@@ -28,6 +28,33 @@ const c = std.c;
 
 const TOOL = common.TOOL;
 
+/// JSON-encode a string into `out` (RFC 8259 escaping), matching JS
+/// JSON.stringify of a plain string. Escapes `"`, `\`, the C0 control
+/// characters, and emits `\uXXXX` for any remaining byte < 0x20. Used to embed
+/// the statusline `command` value in the setup nudge so a script path with a
+/// quote, backslash, or control byte can never produce malformed JSON that the
+/// model would then copy verbatim into settings.json.
+fn appendJsonString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
+    try out.append(gpa, '"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try out.appendSlice(gpa, "\\\""),
+            '\\' => try out.appendSlice(gpa, "\\\\"),
+            '\n' => try out.appendSlice(gpa, "\\n"),
+            '\r' => try out.appendSlice(gpa, "\\r"),
+            '\t' => try out.appendSlice(gpa, "\\t"),
+            else => {
+                if (ch < 0x20) {
+                    try out.print(gpa, "\\u{x:0>4}", .{ch});
+                } else {
+                    try out.append(gpa, ch);
+                }
+            },
+        }
+    }
+    try out.append(gpa, '"');
+}
+
 /// The JS fallback ruleset, reproduced byte-for-byte from
 /// src/hooks/caveman-activate.js (the `else` branch when SKILL.md is absent).
 /// `{label}` is substituted for the canonical mode label in two places.
@@ -55,14 +82,14 @@ fn emitFallbackRuleset(out: *std.ArrayList(u8), gpa: std.mem.Allocator, label: [
 
 /// Append the statusline-setup nudge if settings.json has no `statusLine` key.
 /// Mirrors caveman-activate.js step 3. Silent on any anomaly — never blocks.
-fn appendStatuslineNudge(out: *std.ArrayList(u8), gpa: std.mem.Allocator) void {
+fn appendStatuslineNudge(io: std.Io, out: *std.ArrayList(u8), gpa: std.mem.Allocator) void {
     const settings = common.claudeConfigFile(gpa, "settings.json") catch return;
     defer gpa.free(settings);
 
     // hasStatusline = settings.json parses and has a `statusLine` key.
     var has_statusline = false;
-    if (common.isRegularFileNoSymlink(settings)) {
-        if (common.readFileAlloc(gpa, settings, 1024 * 1024)) |raw| {
+    if (common.isRegularFileNoSymlink(io, settings)) {
+        if (common.readFileAlloc(io, gpa, settings, 1024 * 1024)) |raw| {
             defer gpa.free(raw);
             if (std.json.parseFromSlice(std.json.Value, gpa, raw, .{})) |parsed| {
                 defer parsed.deinit();
@@ -85,18 +112,22 @@ fn appendStatuslineNudge(out: *std.ArrayList(u8), gpa: std.mem.Allocator) void {
     defer gpa.free(script_path);
     const settings_path = std.fs.path.join(gpa, &.{ claude_dir, "settings.json" }) catch return;
     defer gpa.free(settings_path);
+    const command = std.fmt.allocPrint(gpa, "bash \"{s}\"", .{script_path}) catch return;
+    defer gpa.free(command);
 
-    // command = `bash "<script_path>"` then JSON.stringify(command).
-    // JSON.stringify of a path with no special chars = quote + body + quote.
+    // command = `bash "<script_path>"` then JSON.stringify(command). Escape the
+    // command value through appendJsonString so a script path containing a
+    // quote, backslash, or control byte can never emit malformed JSON in the
+    // nudge the model surfaces (and may copy verbatim into settings.json).
     out.appendSlice(gpa, "\n\n") catch return;
     out.appendSlice(gpa, "STATUSLINE SETUP NEEDED: The caveman plugin includes a statusline badge showing active mode ") catch return;
     out.appendSlice(gpa, "(e.g. [CAVEMAN], [CAVEMAN:ULTRA]). It is not configured yet. ") catch return;
     out.appendSlice(gpa, "To enable, add this to ") catch return;
     out.appendSlice(gpa, settings_path) catch return;
     out.appendSlice(gpa, ": ") catch return;
-    out.appendSlice(gpa, "\"statusLine\": { \"type\": \"command\", \"command\": \"bash \\\"") catch return;
-    out.appendSlice(gpa, script_path) catch return;
-    out.appendSlice(gpa, "\\\"\" } ") catch return;
+    out.appendSlice(gpa, "\"statusLine\": { \"type\": \"command\", \"command\": ") catch return;
+    appendJsonString(out, gpa, command) catch return;
+    out.appendSlice(gpa, " } ") catch return;
     out.appendSlice(gpa, "Proactively offer to set this up for the user on first interaction.") catch return;
 }
 
@@ -112,7 +143,12 @@ pub fn main() !void {
     defer _ = gpa_state.deinit();
     const gpa = gpa_state.allocator();
 
-    const mode = common.getDefaultMode(gpa);
+    // Construct the std.Io backend once; thread it down to every FS fn.
+    var threaded = common.threaded();
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const mode = common.getDefaultMode(io, gpa);
 
     const path = common.flagPath(gpa) catch {
         // No HOME / config dir — mirror JS: still print something sensible.
@@ -123,13 +159,13 @@ pub fn main() !void {
 
     // "off" mode — skip activation entirely; delete flag, print OK, exit.
     if (std.mem.eql(u8, mode, "off")) {
-        common.unlinkFlag(path);
+        common.unlinkFlag(io, path);
         common.writeStdout("OK");
         return;
     }
 
     // 1. Write flag file (symlink-safe). Silent-fail like the JS.
-    common.safeWriteFlag(gpa, path, mode) catch {};
+    common.safeWriteFlag(io, gpa, path, mode) catch {};
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
@@ -152,7 +188,7 @@ pub fn main() !void {
     try emitFallbackRuleset(&out, gpa, label);
 
     // 3. Statusline-setup nudge if not configured.
-    appendStatuslineNudge(&out, gpa);
+    appendStatuslineNudge(io, &out, gpa);
 
     common.writeStdout(out.items);
 }
@@ -178,6 +214,14 @@ test "emitFallbackRuleset embeds level label twice" {
     try std.testing.expect(std.mem.indexOf(u8, out.items, "## Rules") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "## Auto-Clarity") != null);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "## Boundaries") != null);
+}
+
+test "appendJsonString escapes statusline command" {
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try appendJsonString(&out, gpa, "bash \"/tmp/a \\\"quoted\\\" path/statusline.sh\"");
+    try std.testing.expectEqualStrings("\"bash \\\"/tmp/a \\\\\\\"quoted\\\\\\\" path/statusline.sh\\\"\"", out.items);
 }
 
 test "wenyan alias resolves to wenyan-full label" {
@@ -206,29 +250,35 @@ test "independent mode emits short activation line" {
 }
 
 test "off mode deletes flag and prints OK" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = std.testing.allocator;
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
 
     const flag = try std.fs.path.join(gpa, &.{ dir_path, ".off-active" });
     defer gpa.free(flag);
-    try common.writeSmall(flag, "full"); // pre-existing flag
-    try std.testing.expect(common.isRegularFileNoSymlink(flag));
+    try common.writeSmall(io, flag, "full"); // pre-existing flag
+    try std.testing.expect(common.isRegularFileNoSymlink(io, flag));
 
     // Simulate the off branch: unlink + would print "OK".
-    common.unlinkFlag(flag);
-    try std.testing.expect(!common.isRegularFileNoSymlink(flag));
+    common.unlinkFlag(io, flag);
+    try std.testing.expect(!common.isRegularFileNoSymlink(io, flag));
 }
 
 test "activate writes flag then ruleset references it" {
+    var th = common.threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = std.testing.allocator;
-    const dir_path = try common.makeTmpDir(gpa);
+    const dir_path = try common.makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
     const flag = try std.fs.path.join(gpa, &.{ dir_path, ".act-active" });
     defer gpa.free(flag);
 
-    try common.safeWriteFlag(gpa, flag, "lite");
-    const data = try common.readSmall(gpa, flag);
+    try common.safeWriteFlag(io, gpa, flag, "lite");
+    const data = try common.readSmall(io, gpa, flag);
     defer gpa.free(data);
     try std.testing.expectEqualStrings("lite", data);
 
@@ -237,6 +287,5 @@ test "activate writes flag then ruleset references it" {
     try emitFallbackRuleset(&out, gpa, "lite");
     try std.testing.expect(std.mem.indexOf(u8, out.items, "Current level: **lite**.") != null);
 
-    var fb: [std.fs.max_path_bytes]u8 = undefined;
-    _ = c.unlink(try common.toZ(&fb, flag));
+    common.unlinkFlag(io, flag);
 }

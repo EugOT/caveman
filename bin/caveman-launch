@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# caveman-launch — resolve a caveman Zig binary and exec it (passing stdin + args).
+#
+# Used by the Claude Code plugin (.claude-plugin/plugin.json) so the plugin can run
+# the native Zig hooks without bundling per-platform blobs: it finds an already-
+# installed binary, or a local build, or downloads+verifies the per-platform release
+# archive on first use (cached under $CAVEMAN_CACHE), then execs the requested binary.
+#
+# Usage:  caveman-launch <binary-name> [args...]      (stdin is forwarded)
+#   e.g.  caveman-launch caveman-activate
+#         caveman-launch caveman-hook
+#
+# Resolution order:
+#   1. $CLAUDE_CONFIG_DIR/hooks/<name>        (standalone install dropped it here)
+#   2. <plugin-root>/zig/zig-out/bin/<name>   (local clone / dev build)
+#   3. $CAVEMAN_CACHE/<version>/<name>        (previously downloaded)
+#   4. download caveman-<plat>.tar.gz from the latest Release → SHA-256 verify →
+#      extract into $CAVEMAN_CACHE → use it
+#
+# Pure-Zig runtime: this launcher is host-automation shell, not application logic.
+set -uo pipefail
+
+REPO="JuliusBrussee/caveman"
+NAME="${1:-}"
+[ -n "$NAME" ] || { echo "caveman-launch: missing binary name" >&2; exit 2; }
+shift || true
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || here=""
+CACHE="${CAVEMAN_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/caveman/bin}"
+
+# exec the binary at $1 with all remaining launcher args ($@, already shifted past
+# the binary name) if it exists and is executable; otherwise return so the next
+# resolution step runs. stdin is inherited by exec, so hooks still read it.
+try_exec() { local b="$1"; shift; [ -x "$b" ] && exec "$b" "$@"; }
+
+# 1. standalone-installed hooks dir
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+try_exec "$CFG/hooks/$NAME" "$@"
+
+# 2. local clone / dev build
+[ -n "$here" ] && try_exec "$here/../zig/zig-out/bin/$NAME" "$@"
+
+# 3. previously downloaded
+try_exec "$CACHE/$NAME" "$@"
+
+# 4. download + verify + cache
+detect_platform() {
+  local os arch; os="$(uname -s)"; arch="$(uname -m)"
+  case "$os" in Darwin) os=macos ;; Linux) os=linux ;; *) echo "caveman-launch: unsupported OS $os (Windows uses the PowerShell shim)" >&2; exit 1 ;; esac
+  case "$arch" in arm64|aarch64) arch=arm64 ;; x86_64|amd64) arch=x64 ;; *) echo "caveman-launch: unsupported arch $arch" >&2; exit 1 ;; esac
+  printf '%s-%s' "$os" "$arch"
+}
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | awk '{print $1}'
+  else echo "caveman-launch: no sha256 tool" >&2; exit 1; fi
+}
+
+command -v curl >/dev/null 2>&1 || { echo "caveman-launch: curl required to fetch binaries" >&2; exit 1; }
+plat="$(detect_platform)"
+archive="caveman-$plat.tar.gz"
+base="https://github.com/$REPO/releases/latest/download"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/caveman-launch.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+
+curl -fsSL "$base/$archive"        -o "$tmp/$archive"        || { echo "caveman-launch: download failed ($archive)" >&2; exit 1; }
+curl -fsSL "$base/$archive.sha256" -o "$tmp/$archive.sha256" || { echo "caveman-launch: checksum download failed" >&2; exit 1; }
+want="$(awk '{print $1}' "$tmp/$archive.sha256")"; got="$(sha256_of "$tmp/$archive")"
+[ "$want" = "$got" ] || { echo "caveman-launch: SHA-256 mismatch — refusing" >&2; exit 1; }
+
+mkdir -p "$CACHE"
+tar -C "$CACHE" -xzf "$tmp/$archive" || { echo "caveman-launch: extract failed" >&2; exit 1; }
+chmod +x "$CACHE"/caveman-* 2>/dev/null || true
+try_exec "$CACHE/$NAME" "$@"
+
+echo "caveman-launch: could not resolve '$NAME' (not in archive?)" >&2
+exit 1

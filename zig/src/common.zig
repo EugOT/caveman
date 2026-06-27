@@ -1,4 +1,4 @@
-//! Shared caveman/ponytail hook primitives — Zig 0.16, libc C-ABI.
+//! Shared caveman/ponytail hook primitives — Zig 0.16, std.fs/std.Io.
 //!
 //! Extracted from the original single-file PoC so the UserPromptSubmit hook
 //! (main.zig), the SessionStart activate binary (activate.zig), and the
@@ -10,16 +10,45 @@
 //!   - the symlink-safe flag write (safeWriteFlag + ancestorUnsafe) — the
 //!     security core: refuse-on-symlink, atomic temp+rename, O_NOFOLLOW, 0600
 //!   - flagPath resolution
-//!   - the libc read/write/path helpers everything needs
+//!   - the read/write/path helpers everything needs
 //!
-//! Written against the stable libc C ABI (std.c + a few extern decls) rather
-//! than the in-flight std.Io surface — every hook binary links libc anyway and
-//! this keeps the security logic pinned to a stable interface. The PoC can
-//! migrate to std.Io once 0.16 stabilizes; the security properties are identical.
+//! R6a — migrated the filesystem core off the libc C-ABI (c.Stat/c.O/c.S, raw
+//! lstat/open/read/write/rename) onto the portable std.fs/std.Io surface so the
+//! whole tree cross-compiles (x86_64-linux-gnu, x86_64-windows-gnu, native).
+//!
+//! Mechanism mapping (behavior is BYTE-IDENTICAL to the libc version):
+//!   - lstat-classify            → Dir.statFile(io, p, .{ .follow_symlinks = false }).kind
+//!   - O_NOFOLLOW open (read)    → Dir.openFile(io, p, .{ .follow_symlinks = false })
+//!   - O_CREAT|O_EXCL temp write → Dir.createFile(io, p, .{ .exclusive = true, ... });
+//!                                 O_EXCL refuses an existing path (incl. a symlink),
+//!                                 the same clobber guard O_NOFOLLOW gave on the leaf.
+//!   - atomic rename             → Dir.renameAbsolute(tmp, real, io)
+//!   - mkdir 0700                → Dir.createDirAbsolute(io, dir, perms)  (ignore AlreadyExists)
+//!   - realpath(3)               → Dir.realPathFileAbsolute(io, p, buf)
+//!   - read(2) loop              → File.readPositional(io, iovec, offset) loop
+//!   - write(2) loop             → File.writePositionalAll(io, bytes, offset)
+//!   - fchmod 0600               → File.setPermissions(io, .fromMode(0600))  (POSIX only)
+//!
+//! THE ONE LIBC EXCEPTION — the uid-ownership compare. std.Io.File.Stat carries
+//! no owner uid (inode/nlink/size/permissions/kind/times only), and std.posix.Stat
+//! / std.c.Stat are `void` for the linux compile target, so there is no portable
+//! std primitive that yields a file's owner uid. Per the migration contract we
+//! keep ONE target-aware owner-uid probe (`pathUid`) plus `getuid` — implemented
+//! through std's OWN target-correct syscall surfaces (linux `statx`, macOS/BSD
+//! libc `stat`, Windows → null/no-uid). This is the only stat-by-uid path that
+//! remains, and it is needed solely for the "symlinked flag dir must be owned by
+//! the current uid" check that `resolveRealFlagDir` enforces. Everything else is
+//! std.Io.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const c = std.c;
+
+const is_windows = builtin.os.tag == .windows;
+
+/// std.Io handle, threaded down from each binary's main. See `Io` below.
+pub const Io = std.Io;
 
 /// "caveman" or "ponytail" — selected at configure time by -Dtool.
 pub const TOOL = build_options.tool;
@@ -30,13 +59,40 @@ pub const FLAG_NAME = "." ++ TOOL ++ "-active";
 /// Pre-rendered savings-suffix filename written by caveman-stats.js.
 pub const STATUSLINE_SUFFIX_NAME = "." ++ TOOL ++ "-statusline-suffix";
 
-// libc decls not surfaced under these names in std.c for this dev build.
+// libc decls still needed for the non-FS bits (env, stdio, time, getpid) that
+// every hook binary already links libc for. The FS core no longer uses raw
+// lstat/open/read/write/rename — those moved to std.Io (see file header).
 pub extern "c" fn close(fd: c_int) c_int;
-pub extern "c" fn lstat(path: [*:0]const u8, buf: *c.Stat) c_int;
 pub extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 pub extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-// resolved_path must point to a buffer of at least PATH_MAX bytes.
-pub extern "c" fn realpath(path: [*:0]const u8, resolved_path: [*]u8) ?[*:0]u8;
+
+// THE ONE remaining stat — macOS/BSD libc stat(2) for the owner-uid compare
+// (see file header). std.c exposes no `stat` fn and no portable Stat with a uid
+// field, so we declare the extern locally and use the target's c.Stat (which
+// carries .uid on darwin/bsd). Only referenced on non-linux/non-windows POSIX;
+// on linux we use the statx syscall, on windows there is no uid.
+const DarwinStat = if (builtin.os.tag == .windows or builtin.os.tag == .linux) void else c.Stat;
+extern "c" fn stat(noalias path: [*:0]const u8, noalias buf: *DarwinStat) c_int;
+extern "c" fn getuid() c.uid_t;
+
+// THE ONE remaining libc open(2) — for the history append path only. std.Io.File
+// has no O_APPEND open mode (OpenFileOptions.Mode is read_only/write_only/
+// read_write), so it cannot give the KERNEL-ATOMIC append the JS contract relies
+// on (caveman-config.js opens with O_APPEND so concurrent stats writers from
+// different sessions never clobber each other's JSONL line). std.c.O is `void` on
+// the linux cross target, so we use POSIX numeric O_* values per-target. Only used
+// on POSIX; the whole append path is gated !is_windows (windows is already in the
+// deferred non-FS-core bucket). O_NOFOLLOW preserves the refuse-symlink-leaf guard.
+extern "c" fn open(path: [*:0]const u8, flags: c_int, ...) c_int;
+extern "c" fn write(fd: c_int, buf: [*]const u8, nbyte: usize) isize;
+const o_append_flags: c_int = switch (builtin.os.tag) {
+    // O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW
+    .linux => 0o1 | 0o100 | 0o2000 | 0o400000,
+    .macos, .ios, .tvos, .watchos => 0x0001 | 0x0200 | 0x0008 | 0x0100,
+    // FreeBSD/NetBSD/OpenBSD/DragonFly share these values.
+    .freebsd, .netbsd, .openbsd, .dragonfly => 0x0001 | 0x0200 | 0x0008 | 0x0100,
+    else => 0, // unused (append path is !is_windows and these are the POSIX targets)
+};
 
 pub const VALID_MODES = [_][]const u8{
     "off",
@@ -85,6 +141,28 @@ pub fn getenv(name: [*:0]const u8) ?[]const u8 {
     return std.mem.sliceTo(p, 0);
 }
 
+// ── std.Io construction ─────────────────────────────────────────────────────
+//
+// Each binary's main constructs a Threaded backend once and threads `io()` down
+// to every FS fn (the 0.16 pattern, see start.zig:711). `defaultIo` packages
+// that so callers need a single line:
+//
+//     var threaded = common.threaded();
+//     defer threaded.deinit();
+//     const io = threaded.io();
+//
+// The Threaded value must outlive the io handle, so it is returned by value and
+// the caller owns its lifetime (deinit on scope exit).
+
+pub fn threaded() std.Io.Threaded {
+    // FS-only use: no argv0/environ needed; the failing allocator is fine for
+    // the async paths we never touch. `page_allocator` keeps it allocation-free
+    // at construction and never fails.
+    return .init(std.heap.page_allocator, .{});
+}
+
+// ── path resolution ─────────────────────────────────────────────────────────
+
 /// Resolve flag path: $CLAUDE_CONFIG_DIR (or $HOME/.claude) + ".<tool>-active".
 pub fn flagPath(gpa: std.mem.Allocator) FlagError![]u8 {
     if (getenv("CLAUDE_CONFIG_DIR")) |base| {
@@ -104,53 +182,105 @@ pub fn claudeConfigFile(gpa: std.mem.Allocator, name: []const u8) FlagError![]u8
     return std.fs.path.join(gpa, &.{ home, ".claude", name });
 }
 
-pub fn readFileAlloc(gpa: std.mem.Allocator, path: []const u8, max_bytes: usize) ?[]u8 {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = toZ(&pbuf, path) catch return null;
-    const flags: c.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true };
-    const fd = c.open(pz, flags, @as(c.mode_t, 0));
-    if (fd < 0) return null;
-    defer _ = close(fd);
+// ── portable FS primitives (std.Io) ─────────────────────────────────────────
+
+const cwd = std.Io.Dir.cwd;
+
+/// Permissions value for a 0600 file. On Windows (ACL model, no POSIX mode) we
+/// fall back to the platform default — the 0600 bit is a POSIX-only property.
+fn perm600() std.Io.File.Permissions {
+    return if (is_windows) .default_file else .fromMode(0o600);
+}
+
+/// Permissions value for a 0700 dir. POSIX-only mode, default on Windows.
+fn perm700() std.Io.File.Permissions {
+    return if (is_windows) .default_dir else .fromMode(0o700);
+}
+
+/// statFile without following symlinks (the lstat equivalent). Returns the
+/// portable std.Io.File.Stat (carries .kind), or null on any error / missing.
+fn lstatKind(io: std.Io, path: []const u8) ?std.Io.File.Kind {
+    const st = cwd().statFile(io, path, .{ .follow_symlinks = false }) catch return null;
+    return st.kind;
+}
+
+/// Owner uid of `path` following symlinks (the realpath-target owner). null on
+/// Windows (no uid) or on any error. THE ONE libc/syscall stat that remains —
+/// see the file header. Uses std's own per-target syscall surface so it stays
+/// correct across native/linux/windows cross-compiles.
+fn pathUid(path: [*:0]const u8) ?u32 {
+    switch (builtin.os.tag) {
+        .windows => return null,
+        .linux => {
+            const linux = std.os.linux;
+            var sx: linux.Statx = undefined;
+            // flags = 0 → follow symlinks (matches the old stat(2) on realpath).
+            const rc = linux.statx(linux.AT.FDCWD, path, 0, .{ .UID = true }, &sx);
+            if (linux.errno(rc) != .SUCCESS) return null;
+            return @intCast(sx.uid);
+        },
+        else => {
+            // macOS / BSD: libc stat(2) with the target's c.Stat (which carries
+            // a uid field on these targets). Declared locally; the only libc
+            // stat in the file.
+            var st: DarwinStat = undefined;
+            if (stat(path, &st) != 0) return null;
+            return @intCast(st.uid);
+        },
+    }
+}
+
+/// Current process uid. Windows has no uid; return 0 (never compared there).
+fn currentUid() u32 {
+    if (is_windows) return 0;
+    return @intCast(getuid());
+}
+
+pub fn readFileAlloc(io: std.Io, gpa: std.mem.Allocator, path: []const u8, max_bytes: usize) ?[]u8 {
+    var f = cwd().openFile(io, path, .{ .follow_symlinks = false }) catch return null;
+    defer f.close(io);
 
     var out: std.ArrayList(u8) = .empty;
     var buf: [512]u8 = undefined;
+    var offset: u64 = 0;
     while (out.items.len <= max_bytes) {
-        const n = c.read(fd, &buf, buf.len);
-        if (n < 0) {
+        var iov = [_][]u8{&buf};
+        const n = f.readPositional(io, &iov, offset) catch {
             out.deinit(gpa);
             return null;
-        }
+        };
         if (n == 0) {
             return out.toOwnedSlice(gpa) catch {
                 out.deinit(gpa);
                 return null;
             };
         }
-        const next_len = out.items.len + @as(usize, @intCast(n));
+        const next_len = out.items.len + n;
         if (next_len > max_bytes) {
             out.deinit(gpa);
             return null;
         }
-        out.appendSlice(gpa, buf[0..@intCast(n)]) catch {
+        out.appendSlice(gpa, buf[0..n]) catch {
             out.deinit(gpa);
             return null;
         };
+        offset += n;
     }
     out.deinit(gpa);
     return null;
 }
 
-pub fn isRegularFileNoSymlink(path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(&buf, path) catch return false;
-    var st: c.Stat = undefined;
-    if (lstat(z, &st) != 0) return false;
-    return (st.mode & c.S.IFMT) == c.S.IFREG;
+pub fn isRegularFileNoSymlink(io: std.Io, path: []const u8) bool {
+    return (lstatKind(io, path) orelse return false) == .file;
 }
 
-fn readModeFromConfigFile(gpa: std.mem.Allocator, path: []const u8) ?[]const u8 {
-    if (!isRegularFileNoSymlink(path)) return null;
-    const raw = readFileAlloc(gpa, path, 16 * 1024) orelse return null;
+pub fn existsNoFollow(io: std.Io, path: []const u8) bool {
+    return lstatKind(io, path) != null;
+}
+
+fn readModeFromConfigFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    if (!isRegularFileNoSymlink(io, path)) return null;
+    const raw = readFileAlloc(io, gpa, path, 16 * 1024) orelse return null;
     defer gpa.free(raw);
 
     const parsed = std.json.parseFromSlice(std.json.Value, gpa, raw, .{}) catch return null;
@@ -167,7 +297,7 @@ fn readModeFromConfigFile(gpa: std.mem.Allocator, path: []const u8) ?[]const u8 
     return canonicalMode(mode);
 }
 
-fn repoConfigMode(gpa: std.mem.Allocator) ?[]const u8 {
+fn repoConfigMode(io: std.Io, gpa: std.mem.Allocator) ?[]const u8 {
     var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
     const cwd_z = c.getcwd(&cwd_buf, cwd_buf.len) orelse return null;
     var dir: []const u8 = std.mem.sliceTo(cwd_z, 0);
@@ -176,11 +306,11 @@ fn repoConfigMode(gpa: std.mem.Allocator) ?[]const u8 {
     while (depth < 64) : (depth += 1) {
         const nested = std.fs.path.join(gpa, &.{ dir, ".caveman", "config.json" }) catch return null;
         defer gpa.free(nested);
-        if (readModeFromConfigFile(gpa, nested)) |mode| return mode;
+        if (readModeFromConfigFile(io, gpa, nested)) |mode| return mode;
 
         const flat = std.fs.path.join(gpa, &.{ dir, ".caveman.json" }) catch return null;
         defer gpa.free(flat);
-        if (readModeFromConfigFile(gpa, flat)) |mode| return mode;
+        if (readModeFromConfigFile(io, gpa, flat)) |mode| return mode;
 
         const parent = std.fs.path.dirname(dir) orelse return null;
         if (parent.len == dir.len) return null;
@@ -189,7 +319,7 @@ fn repoConfigMode(gpa: std.mem.Allocator) ?[]const u8 {
     return null;
 }
 
-fn userConfigMode(gpa: std.mem.Allocator) ?[]const u8 {
+fn userConfigMode(io: std.Io, gpa: std.mem.Allocator) ?[]const u8 {
     const path = if (getenv("XDG_CONFIG_HOME")) |xdg|
         std.fs.path.join(gpa, &.{ xdg, "caveman", "config.json" }) catch return null
     else if (getenv("HOME")) |home|
@@ -199,19 +329,21 @@ fn userConfigMode(gpa: std.mem.Allocator) ?[]const u8 {
     else
         return null;
     defer gpa.free(path);
-    return readModeFromConfigFile(gpa, path);
+    return readModeFromConfigFile(io, gpa, path);
 }
 
-pub fn getDefaultMode(gpa: std.mem.Allocator) []const u8 {
+pub fn getDefaultMode(io: std.Io, gpa: std.mem.Allocator) []const u8 {
     if (getenv("CAVEMAN_DEFAULT_MODE")) |mode| {
         if (canonicalMode(mode)) |m| return m;
     }
-    if (repoConfigMode(gpa)) |mode| return mode;
-    if (userConfigMode(gpa)) |mode| return mode;
+    if (repoConfigMode(io, gpa)) |mode| return mode;
+    if (userConfigMode(io, gpa)) |mode| return mode;
     return "full";
 }
 
-/// Copy a slice into a fixed NUL-terminated buffer for C calls.
+/// Copy a slice into a fixed NUL-terminated buffer (for the few libc calls that
+/// remain — env, the uid probe). Kept for the uid path + callers that still
+/// build a sentinel path.
 pub fn toZ(buf: []u8, s: []const u8) FlagError![*:0]const u8 {
     if (s.len + 1 > buf.len) return error.PathTooLong;
     @memcpy(buf[0..s.len], s);
@@ -219,44 +351,37 @@ pub fn toZ(buf: []u8, s: []const u8) FlagError![*:0]const u8 {
     return @ptrCast(buf.ptr);
 }
 
-/// lstat a path; true if it exists AND is a symlink (refuse-on-symlink check).
-pub fn isSymlink(path: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(&buf, path) catch return true; // refuse pathological lengths
-    var st: c.Stat = undefined;
-    if (lstat(z, &st) != 0) return false; // ENOENT etc → not a symlink
-    return (st.mode & c.S.IFMT) == c.S.IFLNK;
+/// statFile (no-follow); true if it exists AND is a symlink (refuse-on-symlink).
+pub fn isSymlink(io: std.Io, path: []const u8) bool {
+    return (lstatKind(io, path) orelse return false) == .sym_link;
 }
 
-/// lstat; classify a path component as a (real) directory, a symlink, missing,
-/// or other. Used to walk a directory chain refusing any non-directory link.
+/// classify a path component as a (real) directory, a symlink, missing, or
+/// other. Used to walk a directory chain refusing any non-directory link.
 pub const Comp = enum { dir, symlink, missing, other };
-pub fn classify(path: []const u8) Comp {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(&buf, path) catch return .symlink; // pathological → treat unsafe
-    var st: c.Stat = undefined;
-    if (lstat(z, &st) != 0) return .missing;
-    const kind = st.mode & c.S.IFMT;
-    if (kind == c.S.IFLNK) return .symlink;
-    if (kind == c.S.IFDIR) return .dir;
-    return .other;
+pub fn classify(io: std.Io, path: []const u8) Comp {
+    const kind = lstatKind(io, path) orelse return .missing;
+    return switch (kind) {
+        .sym_link => .symlink,
+        .directory => .dir,
+        else => .other,
+    };
 }
 
-/// realpath a path into `out` (libc realpath(3)); returns the resolved slice or
-/// null on failure. `out` must be >= PATH_MAX.
-fn realpathZ(path: []const u8, out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
-    var ibuf: [std.fs.max_path_bytes]u8 = undefined;
-    const z = toZ(&ibuf, path) catch return null;
-    const r = realpath(z, out) orelse return null;
-    return std.mem.sliceTo(r, 0);
+/// realpath a path into `out`; returns the resolved slice or null on failure.
+/// `out` must be >= std.fs.max_path_bytes. Uses the cwd-relative form so it
+/// accepts both absolute and relative inputs (no isAbsolute assert).
+fn realpathInto(io: std.Io, path: []const u8, out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    const len = cwd().realPathFile(io, path, out) catch return null;
+    return out[0..len];
 }
 
 /// True if reaching `dir` would pass through a symlink an attacker could plant
 /// at ANY level below a trusted base — not just the immediate parent. Mirrors
 /// the JS hooks fs-safe isAnyAncestorSymlink: anchor on the realpath of the
 /// longest trusted base that lexically prefixes `dir` (absorbing benign system
-/// links like /var above the user area), then lstat-walk each tail component,
-/// refusing any symlinked or non-directory ancestor.
+/// links like /var above the user area), then statFile-walk each tail
+/// component, refusing any symlinked or non-directory ancestor.
 /// Strip trailing '/' chars (but keep a lone "/"). Mirrors how path.resolve
 /// normalizes a base before a prefix comparison.
 fn trimTrailingSlash(s: []const u8) []const u8 {
@@ -265,8 +390,19 @@ fn trimTrailingSlash(s: []const u8) []const u8 {
     return s[0..end];
 }
 
-pub fn ancestorUnsafe(dir: []const u8) bool {
-    const bases: [3]?[]const u8 = .{ getenv("HOME"), getenv("TMPDIR"), getenv("CLAUDE_CONFIG_DIR") };
+pub fn ancestorUnsafe(io: std.Io, dir: []const u8) bool {
+    // Trusted roots. Beyond HOME/TMPDIR/CLAUDE_CONFIG_DIR, honor the configured
+    // agent roots (XDG, opencode, openclaw, nullclaw) so a legitimate config dir
+    // outside HOME is not wrongly refused. (PR #8 / 511a8c1.)
+    const bases: [7]?[]const u8 = .{
+        getenv("HOME"),
+        getenv("TMPDIR"),
+        getenv("CLAUDE_CONFIG_DIR"),
+        getenv("XDG_CONFIG_HOME"),
+        getenv("OPENCODE_CONFIG_DIR"),
+        getenv("OPENCLAW_WORKSPACE"),
+        getenv("NULLCLAW_WORKSPACE"),
+    };
 
     var best_base: ?[]const u8 = null;
     for (bases) |maybe| {
@@ -286,10 +422,26 @@ pub fn ancestorUnsafe(dir: []const u8) bool {
     }
     const base = best_base orelse return true; // outside every trusted base → refuse
 
+    // Anchor on the realpath of the deepest EXISTING ancestor at/under `base`.
+    // realpath returns an error on a nonexistent final component, so we must NOT
+    // realpath `base` (or `dir`) directly — on first run the config dir does not
+    // exist yet, which previously made this refuse every legitimate write. Climb
+    // up from `base` until realpath succeeds; the components below that (still
+    // nonexistent) are created by mkdir as real dirs, so they are safe.
     var anchor_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const anchor = realpathZ(base, &anchor_buf) orelse return true;
+    var existing = base;
+    const anchor: []const u8 = realpathInto(io, existing, &anchor_buf) orelse blk: {
+        while (true) {
+            const up = std.fs.path.dirname(existing) orelse return true;
+            if (up.len == existing.len) return true; // reached root, still unresolved
+            existing = up;
+            if (realpathInto(io, existing, &anchor_buf)) |a| break :blk a;
+        }
+    };
 
-    const tail = dir[base.len..]; // leading '/' or empty
+    // Walk every component from the resolved anchor down to `dir`, statFile-ing
+    // each on the real anchor so an intermediate symlink surfaces as a component.
+    const tail = dir[existing.len..]; // portion of dir below the resolved ancestor
     var cur_buf: [std.fs.max_path_bytes]u8 = undefined;
     if (anchor.len >= cur_buf.len) return true;
     @memcpy(cur_buf[0..anchor.len], anchor);
@@ -302,7 +454,7 @@ pub fn ancestorUnsafe(dir: []const u8) bool {
         @memcpy(cur_buf[cur_len + 1 ..][0..part.len], part);
         cur_len += 1 + part.len;
         const cur = cur_buf[0..cur_len];
-        switch (classify(cur)) {
+        switch (classify(io, cur)) {
             .missing => return false, // tail not created yet → mkdir makes real dirs
             .symlink, .other => return true,
             .dir => {},
@@ -311,64 +463,89 @@ pub fn ancestorUnsafe(dir: []const u8) bool {
     return false;
 }
 
-/// Symlink-safe atomic flag write. The security core.
-pub fn safeWriteFlag(gpa: std.mem.Allocator, path: []const u8, content: []const u8) FlagError!void {
-    if (isSymlink(path)) return error.SymlinkRefused;
+/// Resolve the directory to write into, honoring a symlinked parent the same way
+/// caveman-config.js safeWriteFlag does: a symlinked flag dir is ALLOWED iff its
+/// realpath target is a directory owned by the current uid (the legitimate
+/// `~/.claude`-as-symlink pattern); a symlink to a dir owned by another user, or
+/// to a non-directory, is refused. Returns the real dir (owned slice in `out`),
+/// or null to refuse. Mirrors the JS uid-ownership contract — NOT a recursive
+/// ancestor walk (the JS only checks the immediate parent).
+fn resolveRealFlagDir(io: std.Io, dir: []const u8, out: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+    const kind = lstatKind(io, dir) orelse return null; // lstat error → refuse (JS returns)
+    if (kind != .sym_link) {
+        // Not a symlink: write directly into `dir`.
+        if (dir.len >= out.len) return null;
+        @memcpy(out[0..dir.len], dir);
+        return out[0..dir.len];
+    }
+    // Symlinked parent: resolve and verify the target is a uid-owned directory.
+    const real = realpathInto(io, dir, out) orelse return null;
+    // statFile the realpath FOLLOWING symlinks (target must be a real dir).
+    const rst = cwd().statFile(io, real, .{ .follow_symlinks = true }) catch return null;
+    if (rst.kind != .directory) return null; // target not a dir
+    // Owner-uid compare — the one remaining libc/syscall stat (see header).
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const rz = toZ(&rbuf, real) catch return null;
+    const owner = pathUid(rz) orelse return null;
+    if (owner != currentUid()) return null; // owned by another user → refuse
+    return real;
+}
 
+/// Symlink-safe atomic flag write. Mirrors caveman-config.js safeWriteFlag:
+/// mkdir -p the dir; allow a uid-owned symlinked parent (resolve it); refuse the
+/// leaf flag file being a symlink (the real clobber vector); write a temp with
+/// O_CREAT|O_EXCL (refuses an existing leaf incl. a symlink) at 0600, chmod
+/// 0600, atomic rename onto the real flag path. Silent on all FS errors.
+pub fn safeWriteFlag(io: std.Io, gpa: std.mem.Allocator, path: []const u8, content: []const u8) FlagError!void {
     const dir = std.fs.path.dirname(path) orelse ".";
-    // Refuse if ANY ancestor directory (not just the immediate parent) is a
-    // symlink an attacker could have planted to redirect the open/rename.
-    if (ancestorUnsafe(dir)) return error.ParentSymlinkRefused;
 
     // Ensure parent exists (0700). Ignore errors (already-exists / race).
-    {
-        var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-        if (toZ(&dbuf, dir)) |dz| {
-            _ = c.mkdir(dz, 0o700);
-        } else |_| {}
-    }
+    cwd().createDir(io, dir, perm700()) catch {};
 
-    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp.{d}", .{ path, c.getpid() });
+    var rdbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const real_dir = resolveRealFlagDir(io, dir, &rdbuf) orelse return error.ParentSymlinkRefused;
+
+    // Real flag path = real_dir / basename(path).
+    const base = std.fs.path.basename(path);
+    const real_path = try std.fs.path.join(gpa, &.{ real_dir, base });
+    defer gpa.free(real_path);
+
+    // The flag file itself must never be a symlink (the actual clobber vector).
+    if (isSymlink(io, real_path)) return error.SymlinkRefused;
+
+    const tmp = try std.fmt.allocPrint(gpa, "{s}.tmp.{d}", .{ real_path, c.getpid() });
     defer gpa.free(tmp);
 
-    var tbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const tz = try toZ(&tbuf, tmp);
-
-    // O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600.
-    const flags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .NOFOLLOW = true };
-    const fd = c.open(tz, flags, @as(c.mode_t, 0o600));
-    if (fd < 0) return error.OpenFailed;
+    // O_CREAT|O_EXCL, mode 0600. O_EXCL fails (EEXIST) on any existing leaf,
+    // INCLUDING a symlink, so it gives the same final-component clobber refusal
+    // O_NOFOLLOW gave on the original create.
+    var f = cwd().createFile(io, tmp, .{ .exclusive = true, .permissions = perm600() }) catch return error.OpenFailed;
     {
-        defer _ = close(fd);
-        var written: usize = 0;
-        while (written < content.len) {
-            const n = c.write(fd, content.ptr + written, content.len - written);
-            if (n <= 0) return error.WriteFailed;
-            written += @intCast(n);
-        }
+        defer f.close(io);
+        if (!is_windows) f.setPermissions(io, perm600()) catch {}; // best-effort, matches JS fchmodSync
+        f.writePositionalAll(io, content, 0) catch return error.WriteFailed;
     }
 
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = try toZ(&pbuf, path);
-    if (c.rename(tz, pz) != 0) {
-        _ = c.unlink(tz);
+    cwd().rename(tmp, cwd(), real_path, io) catch {
+        cwd().deleteFile(io, tmp) catch {};
         return error.RenameFailed;
-    }
+    };
 }
 
 /// Symlink-safe, size-capped, whitelist-validated flag read.
 /// Mirrors caveman-config.js readFlag: refuses symlinks, caps at 64 bytes,
 /// lowercases + trims, returns the canonical mode or null on any anomaly.
 pub const MAX_FLAG_BYTES = 64;
-pub fn readFlagMode(gpa: std.mem.Allocator, path: []const u8) ?[]const u8 {
-    if (!isRegularFileNoSymlink(path)) return null;
-    const raw = readFileAlloc(gpa, path, MAX_FLAG_BYTES) orelse return null;
+pub fn readFlagMode(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?[]const u8 {
+    if (!isRegularFileNoSymlink(io, path)) return null;
+    const raw = readFileAlloc(io, gpa, path, MAX_FLAG_BYTES) orelse return null;
     defer gpa.free(raw);
     const trimmed = std.mem.trim(u8, raw, " \t\r\n");
     return canonicalMode(trimmed);
 }
 
-/// Read all of stdin into an owned buffer using raw read(2).
+/// Read all of stdin into an owned buffer using raw read(2). Stdin is a stream,
+/// not a path — keep the libc read here (no symlink surface, fd 0).
 pub fn readStdin(gpa: std.mem.Allocator) ![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
@@ -412,10 +589,8 @@ pub fn writeStderr(bytes: []const u8) void {
     }
 }
 
-pub fn unlinkFlag(path: []const u8) void {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = toZ(&pbuf, path) catch return;
-    _ = c.unlink(pz);
+pub fn unlinkFlag(io: std.Io, path: []const u8) void {
+    cwd().deleteFile(io, path) catch {};
 }
 
 /// Pre-rendered savings-suffix path under the Claude config dir.
@@ -432,69 +607,78 @@ pub fn historyPath(gpa: std.mem.Allocator) FlagError![]u8 {
 }
 
 /// Symlink-safe append to the history JSONL. Mirrors caveman-config.js
-/// appendFlag: O_APPEND|O_CREAT|O_NOFOLLOW, mode 0600, refuse-on-symlink for
-/// both the target file and any ancestor of its parent, ensure parent exists,
-/// and normalize the trailing newline (strip then add exactly one). Best-effort:
+/// appendFlag: refuse-on-symlink for both the target file and any ancestor of
+/// its parent, ensure parent exists, write at end-of-file with the same
+/// O_NOFOLLOW guard (open existing no-follow, or create exclusively), and
+/// normalize the trailing newline (strip then add exactly one). Best-effort:
 /// silent-fails on every filesystem error — history is never load-bearing.
-pub fn appendHistory(path: []const u8, line: []const u8) void {
-    if (isSymlink(path)) return;
+pub fn appendHistory(io: std.Io, path: []const u8, line: []const u8) void {
+    if (isSymlink(io, path)) return;
     const dir = std.fs.path.dirname(path) orelse ".";
-    if (ancestorUnsafe(dir)) return;
+    if (ancestorUnsafe(io, dir)) return;
 
-    {
-        var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-        if (toZ(&dbuf, dir)) |dz| {
-            _ = c.mkdir(dz, 0o700);
-        } else |_| {}
-    }
+    cwd().createDir(io, dir, perm700()) catch {};
+
+    // KERNEL-ATOMIC append — mirrors caveman-config.js appendFlag exactly:
+    // O_WRONLY|O_CREAT|O_APPEND|O_NOFOLLOW open + a SINGLE write of body+'\n'.
+    // O_APPEND makes the kernel seek-to-end and write atomically per call, so two
+    // concurrent stats writers never read the same size + clobber each other (the
+    // bug a read-size-then-pwrite scheme reintroduces). O_NOFOLLOW keeps the
+    // refuse-symlink-leaf guard. POSIX-only — std.Io.File exposes no append mode;
+    // windows is in the deferred non-FS-core bucket and never reaches this path.
+    if (is_windows) return; // history append is a POSIX-only feature (matches JS getuid-gated path)
+
+    // Mirror JS: String(line).replace(/\n$/, '') + '\n' — strip a single trailing
+    // newline, then write the line plus exactly one newline, in ONE buffer so the
+    // single O_APPEND write is atomic (no interleaving between body and newline).
+    const body = if (line.len > 0 and line[line.len - 1] == '\n') line[0 .. line.len - 1] else line;
+    var stackbuf: [4096]u8 = undefined;
+    var heapbuf: ?[]u8 = null;
+    defer if (heapbuf) |h| std.heap.page_allocator.free(h);
+    const need = body.len + 1;
+    const buf: []u8 = if (need <= stackbuf.len)
+        stackbuf[0..need]
+    else blk: {
+        const h = std.heap.page_allocator.alloc(u8, need) catch return;
+        heapbuf = h;
+        break :blk h;
+    };
+    @memcpy(buf[0..body.len], body);
+    buf[body.len] = '\n';
 
     var pbuf: [std.fs.max_path_bytes]u8 = undefined;
     const pz = toZ(&pbuf, path) catch return;
-
-    const flags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true, .NOFOLLOW = true };
-    const fd = c.open(pz, flags, @as(c.mode_t, 0o600));
+    const fd = open(pz, o_append_flags, @as(c_int, 0o600));
     if (fd < 0) return;
     defer _ = close(fd);
-
-    // Mirror JS: String(line).replace(/\n$/, '') + '\n' — strip a single
-    // trailing newline, then write the line plus exactly one newline.
-    const body = if (line.len > 0 and line[line.len - 1] == '\n') line[0 .. line.len - 1] else line;
-    var written: usize = 0;
-    while (written < body.len) {
-        const n = c.write(fd, body.ptr + written, body.len - written);
-        if (n <= 0) return;
-        written += @intCast(n);
-    }
-    const nl = "\n";
-    _ = c.write(fd, nl.ptr, 1);
+    // Single write — O_APPEND guarantees it lands atomically at the current end.
+    _ = write(fd, buf.ptr, buf.len);
 }
 
 /// Symlink-safe history read. Returns the whole file as an owned buffer or null.
 /// Mirrors caveman-config.js readHistory: refuse symlinks / non-regular files,
 /// no size cap (history grows with use). Caller splits + parses lines.
-pub fn readHistoryFile(gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
-    if (isSymlink(path)) return null;
-    if (!isRegularFileNoSymlink(path)) return null;
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = toZ(&pbuf, path) catch return null;
-    const flags: c.O = .{ .ACCMODE = .RDONLY, .NOFOLLOW = true };
-    const fd = c.open(pz, flags, @as(c.mode_t, 0));
-    if (fd < 0) return null;
-    defer _ = close(fd);
+pub fn readHistoryFile(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+    if (isSymlink(io, path)) return null;
+    if (!isRegularFileNoSymlink(io, path)) return null;
+    var f = cwd().openFile(io, path, .{ .follow_symlinks = false }) catch return null;
+    defer f.close(io);
 
     var out: std.ArrayList(u8) = .empty;
     var buf: [4096]u8 = undefined;
+    var offset: u64 = 0;
     while (true) {
-        const n = c.read(fd, &buf, buf.len);
-        if (n < 0) {
-            out.deinit(gpa);
-            return null;
-        }
-        if (n == 0) break;
-        out.appendSlice(gpa, buf[0..@intCast(n)]) catch {
+        var iov = [_][]u8{&buf};
+        const n = f.readPositional(io, &iov, offset) catch {
             out.deinit(gpa);
             return null;
         };
+        if (n == 0) break;
+        out.appendSlice(gpa, buf[0..n]) catch {
+            out.deinit(gpa);
+            return null;
+        };
+        offset += n;
     }
     return out.toOwnedSlice(gpa) catch {
         out.deinit(gpa);
@@ -518,49 +702,32 @@ test "isValidMode whitelist rejects injection" {
     try std.testing.expect(!isValidMode(""));
 }
 
-/// Make a unique temp dir via libc (Io-free; matches the code under test).
-pub fn makeTmpDir(gpa: std.mem.Allocator) ![]u8 {
+/// Make a unique temp dir via std.Io (matches the code under test).
+pub fn makeTmpDir(io: std.Io, gpa: std.mem.Allocator) ![]u8 {
     const base = getenv("TMPDIR") orelse "/tmp";
     const dir = try std.fmt.allocPrint(gpa, "{s}/zighooktest.{d}", .{ base, c.getpid() });
-    var dbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const dz = try toZ(&dbuf, dir);
-    _ = c.mkdir(dz, 0o700);
+    cwd().createDir(io, dir, perm700()) catch {};
     return dir;
 }
 
-pub fn readSmall(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = try toZ(&pbuf, path);
-    const flags: c.O = .{ .ACCMODE = .RDONLY };
-    const fd = c.open(pz, flags, @as(c.mode_t, 0));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = close(fd);
+pub fn readSmall(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+    var f = try cwd().openFile(io, path, .{});
+    defer f.close(io);
     var buf: [256]u8 = undefined;
-    const n = c.read(fd, &buf, buf.len);
-    if (n < 0) return error.ReadFailed;
-    return gpa.dupe(u8, buf[0..@intCast(n)]);
+    var iov = [_][]u8{&buf};
+    const n = f.readPositional(io, &iov, 0) catch return error.ReadFailed;
+    return gpa.dupe(u8, buf[0..n]);
 }
 
-pub fn writeSmall(path: []const u8, content: []const u8) !void {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = try toZ(&pbuf, path);
-    _ = c.unlink(pz);
-    const flags: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true };
-    const fd = c.open(pz, flags, @as(c.mode_t, 0o600));
-    if (fd < 0) return error.OpenFailed;
-    defer _ = close(fd);
-    var written: usize = 0;
-    while (written < content.len) {
-        const n = c.write(fd, content.ptr + written, content.len - written);
-        if (n <= 0) return error.WriteFailed;
-        written += @intCast(n);
-    }
+pub fn writeSmall(io: std.Io, path: []const u8, content: []const u8) !void {
+    cwd().deleteFile(io, path) catch {};
+    var f = try cwd().createFile(io, path, .{ .exclusive = true, .permissions = perm600() });
+    defer f.close(io);
+    f.writePositionalAll(io, content, 0) catch return error.WriteFailed;
 }
 
-pub fn mkdirPath(path: []const u8) !void {
-    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const pz = try toZ(&pbuf, path);
-    _ = c.mkdir(pz, 0o700);
+pub fn mkdirPath(io: std.Io, path: []const u8) !void {
+    cwd().createDir(io, path, perm700()) catch {};
 }
 
 pub fn saveEnv(gpa: std.mem.Allocator, name: [*:0]const u8) !?[:0]u8 {
@@ -576,20 +743,34 @@ pub fn restoreEnv(name: [*:0]const u8, value: ?[:0]u8) void {
     }
 }
 
+/// Plant a symlink for the tests (std.Io has symLinkAbsolute). Returns true on
+/// success. POSIX-only in practice (Windows symlinks need privilege); the
+/// symlink tests are guarded to POSIX hosts.
+fn testSymlink(io: std.Io, target: []const u8, link: []const u8) bool {
+    cwd().symLink(io, target, link, .{}) catch return false;
+    return true;
+}
+
 test "getDefaultMode reads env before config" {
+    var th = threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = std.testing.allocator;
     const old_default = try saveEnv(gpa, "CAVEMAN_DEFAULT_MODE");
     defer if (old_default) |v| gpa.free(v);
     defer restoreEnv("CAVEMAN_DEFAULT_MODE", old_default);
 
     _ = setenv("CAVEMAN_DEFAULT_MODE", "ULTRA", 1);
-    try std.testing.expectEqualStrings("ultra", getDefaultMode(gpa));
+    try std.testing.expectEqualStrings("ultra", getDefaultMode(io, gpa));
 
     _ = setenv("CAVEMAN_DEFAULT_MODE", "not-a-mode", 1);
-    try std.testing.expect(!std.mem.eql(u8, getDefaultMode(gpa), "not-a-mode"));
+    try std.testing.expect(!std.mem.eql(u8, getDefaultMode(io, gpa), "not-a-mode"));
 }
 
 test "getDefaultMode reads XDG user config" {
+    var th = threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = std.testing.allocator;
     const old_default = try saveEnv(gpa, "CAVEMAN_DEFAULT_MODE");
     defer if (old_default) |v| gpa.free(v);
@@ -600,7 +781,7 @@ test "getDefaultMode reads XDG user config" {
 
     _ = unsetenv("CAVEMAN_DEFAULT_MODE");
 
-    const dir_path = try makeTmpDir(gpa);
+    const dir_path = try makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
     const xdg = try std.fs.path.join(gpa, &.{ dir_path, "xdg" });
     defer gpa.free(xdg);
@@ -609,20 +790,24 @@ test "getDefaultMode reads XDG user config" {
     const config = try std.fs.path.join(gpa, &.{ caveman_dir, "config.json" });
     defer gpa.free(config);
 
-    try mkdirPath(xdg);
-    try mkdirPath(caveman_dir);
-    try writeSmall(config, "{\"defaultMode\":\"review\"}");
+    try mkdirPath(io, xdg);
+    try mkdirPath(io, caveman_dir);
+    try writeSmall(io, config, "{\"defaultMode\":\"review\"}");
 
     const xdg_z = try gpa.dupeZ(u8, xdg);
     defer gpa.free(xdg_z);
     _ = setenv("XDG_CONFIG_HOME", xdg_z.ptr, 1);
 
-    try std.testing.expectEqualStrings("review", getDefaultMode(gpa));
+    try std.testing.expectEqualStrings("review", getDefaultMode(io, gpa));
 }
 
 test "safeWriteFlag refuses symlinked target (clobber attack)" {
+    if (is_windows) return error.SkipZigTest;
+    var th = threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = std.testing.allocator;
-    const dir_path = try makeTmpDir(gpa);
+    const dir_path = try makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
 
     const victim = try std.fs.path.join(gpa, &.{ dir_path, "victim.txt" });
@@ -631,108 +816,247 @@ test "safeWriteFlag refuses symlinked target (clobber attack)" {
     defer gpa.free(flag);
 
     // Create victim with SECRET via the code's own write helpers.
-    {
-        var vb: [std.fs.max_path_bytes]u8 = undefined;
-        const vz = try toZ(&vb, victim);
-        const fl: c.O = .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true };
-        const fd = c.open(vz, fl, @as(c.mode_t, 0o600));
-        try std.testing.expect(fd >= 0);
-        _ = c.write(fd, "SECRET", 6);
-        _ = close(fd);
-    }
+    try writeSmall(io, victim, "SECRET");
 
-    var vbuf: [std.fs.max_path_bytes]u8 = undefined;
-    var fbuf: [std.fs.max_path_bytes]u8 = undefined;
-    const vz = try toZ(&vbuf, victim);
-    const fz = try toZ(&fbuf, flag);
-    try std.testing.expect(c.symlink(vz, fz) == 0); // plant flag -> victim
+    try std.testing.expect(testSymlink(io, victim, flag)); // plant flag -> victim
 
-    try std.testing.expectError(error.SymlinkRefused, safeWriteFlag(gpa, flag, "full"));
+    try std.testing.expectError(error.SymlinkRefused, safeWriteFlag(io, gpa, flag, "full"));
 
-    const data = try readSmall(gpa, victim);
+    const data = try readSmall(io, gpa, victim);
     defer gpa.free(data);
     try std.testing.expectEqualStrings("SECRET", data); // untouched
 
-    _ = c.unlink(fz);
-    _ = c.unlink(vz);
+    cwd().deleteFile(io, flag) catch {};
+    cwd().deleteFile(io, victim) catch {};
 }
 
 test "safeWriteFlag writes mode on clean path" {
+    var th = threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = std.testing.allocator;
-    const dir_path = try makeTmpDir(gpa);
+    const dir_path = try makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
     const flag = try std.fs.path.join(gpa, &.{ dir_path, ".active2" });
     defer gpa.free(flag);
 
-    try safeWriteFlag(gpa, flag, "ultra");
-    const data = try readSmall(gpa, flag);
+    try safeWriteFlag(io, gpa, flag, "ultra");
+    const data = try readSmall(io, gpa, flag);
     defer gpa.free(data);
     try std.testing.expectEqualStrings("ultra", data);
 
-    var fb: [std.fs.max_path_bytes]u8 = undefined;
-    _ = c.unlink(try toZ(&fb, flag));
+    cwd().deleteFile(io, flag) catch {};
 }
 
-test "safeWriteFlag refuses symlinked GRANDPARENT (ancestor) dir" {
+test "safeWriteFlag honors configured opencode root outside HOME" {
+    // A legit config dir under $OPENCODE_CONFIG_DIR (not HOME/TMPDIR) must be a
+    // trusted base — otherwise ancestorUnsafe refuses every write there. (PR #8.)
+    var th = threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = std.testing.allocator;
-    const dir_path = try makeTmpDir(gpa);
+    const old_tmp = try saveEnv(gpa, "TMPDIR");
+    defer if (old_tmp) |v| gpa.free(v);
+    defer restoreEnv("TMPDIR", old_tmp);
+    const old_opencode = try saveEnv(gpa, "OPENCODE_CONFIG_DIR");
+    defer if (old_opencode) |v| gpa.free(v);
+    defer restoreEnv("OPENCODE_CONFIG_DIR", old_opencode);
+
+    _ = unsetenv("TMPDIR");
+
+    const dir_path = try makeTmpDir(io, gpa);
+    defer gpa.free(dir_path);
+    const root = try std.fs.path.join(gpa, &.{ dir_path, "external-opencode" });
+    defer gpa.free(root);
+    try mkdirPath(io, root);
+
+    const root_z = try gpa.dupeZ(u8, root);
+    defer gpa.free(root_z);
+    _ = setenv("OPENCODE_CONFIG_DIR", root_z.ptr, 1);
+
+    const nested = try std.fs.path.join(gpa, &.{ root, "plugins", "caveman" });
+    defer gpa.free(nested);
+    try std.testing.expect(!ancestorUnsafe(io, nested));
+
+    const settings = try std.fs.path.join(gpa, &.{ root, "opencode.json" });
+    defer gpa.free(settings);
+    try safeWriteFlag(io, gpa, settings, "{}\n");
+    const data = try readSmall(io, gpa, settings);
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("{}\n", data);
+
+    cwd().deleteFile(io, settings) catch {};
+}
+
+test "safeWriteFlag ALLOWS a uid-owned symlinked parent dir (JS contract)" {
+    // Mirrors caveman-config.js: a symlinked flag dir is allowed iff its realpath
+    // target is a directory owned by the current uid (the legitimate
+    // ~/.claude-as-symlink pattern). The write lands in the real target dir.
+    if (is_windows) return error.SkipZigTest;
+    var th = threaded();
+    defer th.deinit();
+    const io = th.io();
+    const gpa = std.testing.allocator;
+    const dir_path = try makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
 
-    // real/inner is the genuine tree; link -> real is the symlinked grandparent.
     const real = try std.fs.path.join(gpa, &.{ dir_path, "real" });
     defer gpa.free(real);
-    const inner = try std.fs.path.join(gpa, &.{ real, "inner" });
-    defer gpa.free(inner);
     const link = try std.fs.path.join(gpa, &.{ dir_path, "link" });
     defer gpa.free(link);
 
-    var b1: [std.fs.max_path_bytes]u8 = undefined;
-    var b2: [std.fs.max_path_bytes]u8 = undefined;
-    var b3: [std.fs.max_path_bytes]u8 = undefined;
-    _ = c.mkdir(try toZ(&b1, real), 0o700);
-    _ = c.mkdir(try toZ(&b2, inner), 0o700);
-    try std.testing.expect(c.symlink(try toZ(&b1, real), try toZ(&b3, link)) == 0);
+    try mkdirPath(io, real); // owned by this test's uid
+    try std.testing.expect(testSymlink(io, real, link));
 
-    const flag = try std.fs.path.join(gpa, &.{ link, "inner", ".active3" });
+    // flag dir is the symlink `link` itself → realpath = real (uid-owned dir) → allowed.
+    const flag = try std.fs.path.join(gpa, &.{ link, ".active3" });
     defer gpa.free(flag);
+    try safeWriteFlag(io, gpa, flag, "full");
 
-    try std.testing.expectError(error.ParentSymlinkRefused, safeWriteFlag(gpa, flag, "full"));
-
-    const real_flag = try std.fs.path.join(gpa, &.{ inner, ".active3" });
+    // Written through to the real dir, not the symlink path.
+    const real_flag = try std.fs.path.join(gpa, &.{ real, ".active3" });
     defer gpa.free(real_flag);
-    try std.testing.expect(classify(real_flag) == .missing);
+    const data = try readSmall(io, gpa, real_flag);
+    defer gpa.free(data);
+    try std.testing.expectEqualStrings("full", data);
 
-    _ = c.unlink(try toZ(&b3, link));
+    cwd().deleteFile(io, real_flag) catch {};
+    cwd().deleteFile(io, link) catch {};
 }
 
 test "readFlagMode whitelist + symlink refusal" {
+    if (is_windows) return error.SkipZigTest;
+    var th = threaded();
+    defer th.deinit();
+    const io = th.io();
     const gpa = std.testing.allocator;
-    const dir_path = try makeTmpDir(gpa);
+    const dir_path = try makeTmpDir(io, gpa);
     defer gpa.free(dir_path);
 
     const flag = try std.fs.path.join(gpa, &.{ dir_path, ".readflag" });
     defer gpa.free(flag);
 
     // Valid mode, with trailing newline + uppercase → canonicalized.
-    try writeSmall(flag, "ULTRA\n");
-    try std.testing.expectEqualStrings("ultra", readFlagMode(gpa, flag).?);
+    try writeSmall(io, flag, "ULTRA\n");
+    try std.testing.expectEqualStrings("ultra", readFlagMode(io, gpa, flag).?);
 
     // Junk → null.
-    var fb: [std.fs.max_path_bytes]u8 = undefined;
-    _ = c.unlink(try toZ(&fb, flag));
-    try writeSmall(flag, "rm -rf /");
-    try std.testing.expect(readFlagMode(gpa, flag) == null);
+    cwd().deleteFile(io, flag) catch {};
+    try writeSmall(io, flag, "rm -rf /");
+    try std.testing.expect(readFlagMode(io, gpa, flag) == null);
 
     // Symlink → null (refused).
-    _ = c.unlink(try toZ(&fb, flag));
+    cwd().deleteFile(io, flag) catch {};
     const target = try std.fs.path.join(gpa, &.{ dir_path, "secret.txt" });
     defer gpa.free(target);
-    try writeSmall(target, "full");
-    var tb: [std.fs.max_path_bytes]u8 = undefined;
-    var lb: [std.fs.max_path_bytes]u8 = undefined;
-    try std.testing.expect(c.symlink(try toZ(&tb, target), try toZ(&lb, flag)) == 0);
-    try std.testing.expect(readFlagMode(gpa, flag) == null);
+    try writeSmall(io, target, "full");
+    try std.testing.expect(testSymlink(io, target, flag));
+    try std.testing.expect(readFlagMode(io, gpa, flag) == null);
 
-    _ = c.unlink(try toZ(&lb, flag));
-    _ = c.unlink(try toZ(&tb, target));
+    cwd().deleteFile(io, flag) catch {};
+    cwd().deleteFile(io, target) catch {};
+}
+
+test "appendHistory writes exact bytes and strips one trailing newline" {
+    if (is_windows) return error.SkipZigTest; // history append is POSIX-only
+    var th = threaded();
+    defer th.deinit();
+    const io = th.io();
+    const gpa = std.testing.allocator;
+
+    const dir_path = try makeTmpDir(io, gpa);
+    defer gpa.free(dir_path);
+    const hist = try std.fs.path.join(gpa, &.{ dir_path, ".history.jsonl" });
+    defer gpa.free(hist);
+
+    appendHistory(io, hist, "{\"a\":1}"); // no trailing \n → add one
+    appendHistory(io, hist, "{\"b\":2}\n"); // trailing \n → keep exactly one
+
+    const got = readHistoryFile(io, gpa, hist).?;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings("{\"a\":1}\n{\"b\":2}\n", got);
+
+    // Symlinked history path is refused (no write, secret intact).
+    const secret = try std.fs.path.join(gpa, &.{ dir_path, "secret" });
+    defer gpa.free(secret);
+    try writeSmall(io, secret, "KEEP");
+    const link = try std.fs.path.join(gpa, &.{ dir_path, ".history-link.jsonl" });
+    defer gpa.free(link);
+    try std.testing.expect(testSymlink(io, secret, link));
+    appendHistory(io, link, "{\"c\":3}");
+    const s = try readSmall(io, gpa, secret);
+    defer gpa.free(s);
+    try std.testing.expectEqualStrings("KEEP", s);
+
+    cwd().deleteFile(io, hist) catch {};
+    cwd().deleteFile(io, link) catch {};
+    cwd().deleteFile(io, secret) catch {};
+}
+
+test "appendHistory is atomic under concurrent writers (no torn lines)" {
+    if (is_windows) return error.SkipZigTest;
+    var th = threaded();
+    defer th.deinit();
+    const io = th.io();
+    const gpa = std.testing.allocator;
+
+    const dir_path = try makeTmpDir(io, gpa);
+    defer gpa.free(dir_path);
+    const hist = try std.fs.path.join(gpa, &.{ dir_path, ".concurrent.jsonl" });
+    defer gpa.free(hist);
+
+    // Each of N forked writers appends M lines. Each line is a long, writer-tagged
+    // fixed-width record so a torn/interleaved write would be detectable as a
+    // malformed line. With O_APPEND every write lands atomically at end-of-file;
+    // a read-size-then-pwrite scheme would lose or corrupt lines under this load.
+    const writers = 8;
+    const per_writer = 200;
+    const line_body = "X" ** 300; // > a single write granularity, stresses atomicity
+
+    const fork = c.fork;
+    var pids: [writers]c_int = undefined;
+    for (0..writers) |w| {
+        const pid = fork();
+        if (pid == 0) {
+            // child: append `per_writer` lines tagged with its writer id, then _exit.
+            var i: usize = 0;
+            while (i < per_writer) : (i += 1) {
+                var buf: [400]u8 = undefined;
+                const line = std.fmt.bufPrint(&buf, "w{d:0>2}-{d:0>4}-" ++ line_body, .{ w, i }) catch line_body;
+                appendHistory(io, hist, line);
+            }
+            std.c._exit(0);
+        }
+        pids[w] = pid;
+    }
+    // parent: reap all children.
+    for (pids) |pid| {
+        var status: c_int = undefined;
+        _ = std.c.waitpid(pid, &status, 0);
+    }
+
+    // Verify: exactly writers*per_writer lines, each well-formed (prefix + 300 X's),
+    // no torn lines, every (writer,index) present exactly once.
+    const all = readHistoryFile(io, gpa, hist).?;
+    defer gpa.free(all);
+    var seen = std.AutoHashMap(u32, void).init(gpa);
+    defer seen.deinit();
+    var count: usize = 0;
+    var it = std.mem.tokenizeScalar(u8, all, '\n');
+    while (it.next()) |ln| {
+        count += 1;
+        // shape: wNN-NNNN-XXXX...(300) → total len 3+4+1+300 = wait: "wNN-" =4, "NNNN-"=5, body=300
+        try std.testing.expect(ln.len == 4 + 5 + 300);
+        try std.testing.expect(ln[0] == 'w');
+        // body must be all 'X' (a torn write would splice another record here).
+        for (ln[9..]) |ch| try std.testing.expect(ch == 'X');
+        const w = try std.fmt.parseInt(u32, ln[1..3], 10);
+        const idx = try std.fmt.parseInt(u32, ln[4..8], 10);
+        const key = w * 100000 + idx;
+        try std.testing.expect(!seen.contains(key)); // no duplicate / overwrite
+        try seen.put(key, {});
+    }
+    try std.testing.expectEqual(@as(usize, writers * per_writer), count);
+
+    cwd().deleteFile(io, hist) catch {};
 }
