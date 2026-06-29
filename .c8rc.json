@@ -1,0 +1,14 @@
+{
+  "//": "JS line+branch coverage for the caveman oracle surface. Run via bunx (bun-only policy): `bunx c8 --config .c8rc.json node --test tests/installer/*.test.mjs`. JS is being retired (R6b) so this is the ORACLE/parity baseline, non-blocking — EXCEPT the surviving opencode plugin shim, which gets the full Zig-tier gate (see check-thresholds below).",
+  "include": ["bin/**", "src/**"],
+  "exclude": [
+    "**/*.test.*",
+    "**/node_modules/**",
+    "tests/**"
+  ],
+  "reporter": ["text-summary", "html", "lcov"],
+  "reports-dir": "coverage/js",
+  "all": true,
+  "check-coverage": false,
+  "//thresholds": "check-coverage stays false repo-wide (JS retiring). CI enforces per-file thresholds only on src/plugins/opencode/** (the surviving shim) via a separate c8 invocation."
+}

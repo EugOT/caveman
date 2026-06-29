@@ -13,7 +13,11 @@
     "url": "https://github.com/JuliusBrussee/caveman/issues"
   },
   "scripts": {
-    "test": "cd zig && zig build test -Dtool=caveman"
+    "test": "cd zig && zig build test -Dtool=caveman",
+    "cov": "COVERAGE=1 tests/run-all.sh zig",
+    "cov:js": "bunx c8 --config .c8rc.json --include 'src/plugins/opencode/**' echo 'opencode shim is the only surviving JS; no JS test suite post-R6 (installer tests retired)'",
+    "mutate": "bunx @stryker-mutator/core run",
+    "mutate:opencode": "bunx @stryker-mutator/core run --mutate 'src/plugins/opencode/**/*.js' --break 90"
   },
   "files": [
     "src/",

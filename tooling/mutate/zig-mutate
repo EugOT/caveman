@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# zig-mutate — mutation-test a Zig source file for the caveman meaningful-coverage gate.
+#
+# For each operator-mutation site in FILE (enumerated by mutate.py, which is
+# comment/string/test-block aware), apply the mutation, run the test suite, and
+# classify:
+#   KILLED    — the test suite fails (a test asserted the mutated behavior). Good.
+#   SURVIVED  — the test suite passes despite the mutation. A coverage gap: the
+#               line executed but nothing asserted its behavior. This is the worklist.
+#   EQUIVALENT— the mutated line carries a `// mutation-equivalent:` annotation on
+#               the same or previous line; excluded from the denominator (honest
+#               kill-rate, not gamed). Use ONLY for genuinely unkillable mutants
+#               (debug logs, defensive `else => unreachable`, platform-dead branches).
+#
+# Kill rate = KILLED / (KILLED + SURVIVED).  Gate: >= 90%, every survivor triaged.
+#
+# Safety: the original file is backed up and ALWAYS restored (even on Ctrl-C),
+# via a trap. The harness never leaves a mutated tree behind.
+#
+# Usage:
+#   zig-mutate FILE [--test-cmd "CMD"] [--tool caveman|ponytail] [--json OUT] [--limit N]
+#
+# Defaults: --test-cmd "zig build test -Dtool=<tool>" run from the zig/ dir,
+#           --tool caveman.
+set -uo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ZIGDIR="$REPO/zig"
+MUTATE="$REPO/tooling/mutate/mutate.py"
+ZIG="${ZIG:-/etc/profiles/per-user/etretiakov/bin/zig}"
+
+FILE=""; TOOL="caveman"; TEST_CMD=""; JSON_OUT=""; LIMIT=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --tool) TOOL="$2"; shift 2;;
+    --test-cmd) TEST_CMD="$2"; shift 2;;
+    --json) JSON_OUT="$2"; shift 2;;
+    --limit) LIMIT="$2"; shift 2;;
+    -*) echo "unknown flag $1" >&2; exit 2;;
+    *) FILE="$1"; shift;;
+  esac
+done
+[ -n "$FILE" ] || { echo "usage: zig-mutate FILE [--tool T] [--test-cmd CMD] [--json OUT] [--limit N]" >&2; exit 2; }
+[ -f "$FILE" ] || { echo "no such file: $FILE" >&2; exit 2; }
+[ -n "$TEST_CMD" ] || TEST_CMD="$ZIG build test -Dtool=$TOOL"
+
+BACKUP="$(mktemp)"
+cp "$FILE" "$BACKUP"
+restore() { cp "$BACKUP" "$FILE"; rm -f "$BACKUP"; }
+trap restore EXIT INT TERM
+
+# Establish a green baseline first — if tests already fail, mutation is meaningless.
+echo "→ baseline: $TEST_CMD" >&2
+if ! ( cd "$ZIGDIR" && eval "$TEST_CMD" ) >/dev/null 2>&1; then
+  echo "ERROR: baseline test suite is RED before mutation. Fix tests first." >&2
+  exit 1
+fi
+
+N="$(python3 "$MUTATE" count "$FILE")"
+[ "$LIMIT" -gt 0 ] && [ "$LIMIT" -lt "$N" ] && N="$LIMIT"
+echo "→ $N mutation sites in $FILE" >&2
+
+killed=0; survived=0; equivalent=0
+declare -a SURVIVORS=()
+
+# Is the mutated line annotated as a known-equivalent mutant?
+is_equivalent() { # $1 = line number
+  local ln="$1"
+  sed -n "${ln}p;$((ln-1))p" "$BACKUP" 2>/dev/null | grep -q 'mutation-equivalent:'
+}
+
+for ((i=0; i<N; i++)); do
+  LINE="$(python3 "$MUTATE" list "$FILE" | python3 -c "import json,sys; print(json.load(sys.stdin)[$i]['line'])")"
+  OP="$(python3 "$MUTATE" list "$FILE" | python3 -c "import json,sys; print(json.load(sys.stdin)[$i]['op'])")"
+
+  if is_equivalent "$LINE"; then
+    equivalent=$((equivalent+1))
+    printf "  [%d/%d] L%s %-14s EQUIVALENT (annotated)\n" "$((i+1))" "$N" "$LINE" "$OP" >&2
+    continue
+  fi
+
+  python3 "$MUTATE" apply "$BACKUP" "$i" --out "$FILE"
+  if ( cd "$ZIGDIR" && eval "$TEST_CMD" ) >/dev/null 2>&1; then
+    survived=$((survived+1))
+    SURVIVORS+=("L$LINE $OP")
+    printf "  [%d/%d] L%s %-14s SURVIVED  ✗\n" "$((i+1))" "$N" "$LINE" "$OP" >&2
+  else
+    killed=$((killed+1))
+    printf "  [%d/%d] L%s %-14s killed\n" "$((i+1))" "$N" "$LINE" "$OP" >&2
+  fi
+  cp "$BACKUP" "$FILE"   # restore between mutations
+done
+
+denom=$((killed+survived))
+rate=0
+[ "$denom" -gt 0 ] && rate=$(( killed * 100 / denom ))
+echo "" >&2
+echo "════ $FILE ════" >&2
+echo "  killed=$killed survived=$survived equivalent=$equivalent  kill-rate=${rate}% (gate ≥90%)" >&2
+if [ "${#SURVIVORS[@]}" -gt 0 ]; then
+  echo "  SURVIVORS (add a killing test or annotate // mutation-equivalent:):" >&2
+  for s in "${SURVIVORS[@]}"; do echo "    - $s" >&2; done
+fi
+
+if [ -n "$JSON_OUT" ]; then
+  {
+    printf '{"file":"%s","killed":%d,"survived":%d,"equivalent":%d,"rate":%d,"survivors":[' \
+      "$FILE" "$killed" "$survived" "$equivalent" "$rate"
+    first=1
+    for s in "${SURVIVORS[@]:-}"; do
+      [ -z "$s" ] && continue
+      [ $first -eq 0 ] && printf ','
+      printf '"%s"' "$s"; first=0
+    done
+    printf ']}\n'
+  } > "$JSON_OUT"
+fi
+
+# Exit non-zero if below the gate so CI fails.
+[ "$rate" -ge 90 ]
