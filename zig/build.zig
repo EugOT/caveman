@@ -34,6 +34,21 @@ pub fn build(b: *std.Build) void {
     const opts = b.addOptions();
     opts.addOption([]const u8, "tool", tool);
 
+    // ── Coverage (-Dtest-coverage) ────────────────────────────────────────────
+    // When set, every test binary is run under kcov instead of directly, emitting
+    // line+branch coverage into zig-out/coverage/. kcov is provisioned via the
+    // project flake devShell (see ../flake.nix); CI runs `zig build test
+    // -Dtest-coverage` on the self-hosted runners. The `--exclude-pattern` list
+    // drops Zig constructs that must never execute (unreachable / @panic / the
+    // test blocks themselves) so they don't count as uncovered lines.
+    //
+    // covRun() returns the build step to depend on for a given test artifact:
+    //   - coverage off → a plain RunArtifact (unchanged behavior)
+    //   - coverage on  → a kcov system command wrapping the emitted test binary
+    // The merged report lives at zig-out/coverage/merged (kcov --merge).
+    const test_coverage = b.option(bool, "test-coverage", "Run tests under kcov (line+branch coverage → zig-out/coverage/)") orelse false;
+    const cov = CoverageCtx{ .b = b, .enabled = test_coverage, .merge = if (test_coverage) b.step("coverage-merge", "Merge kcov per-binary reports") else null };
+
     // ── Executables ─────────────────────────────────────────────────────────
     const Bin = struct {
         suffix: []const u8, // "hook" | "activate" | "statusline"
@@ -377,7 +392,7 @@ pub fn build(b: *std.Build) void {
         t.root_module.addOptions("build_options", opts);
         t.root_module.link_libc = true;
         if (std.mem.eql(u8, bin.suffix, "init")) addInitEmbeds(b, t.root_module);
-        test_step.dependOn(&b.addRunArtifact(t).step);
+        test_step.dependOn(cov.run(t, bin.suffix));
     }
 
     // R5 compress-protect test root. Pure module — no common.zig, no libc, no
@@ -393,7 +408,7 @@ pub fn build(b: *std.Build) void {
         });
         const run_cp_test_step = b.step("test-compress-protect", "Run the compress-protect unit tests");
         run_cp_test_step.dependOn(&b.addRunArtifact(cp_test).step);
-        test_step.dependOn(&b.addRunArtifact(cp_test).step);
+        test_step.dependOn(cov.run(cp_test, "compress_protect"));
     }
 
     // R5 stage 2 — compress orchestrator test root. compress_cmd.zig imports the
@@ -444,7 +459,7 @@ pub fn build(b: *std.Build) void {
 
         const run_cmd_test_step = b.step("test-compress-cmd", "Run the compress orchestrator unit tests");
         run_cmd_test_step.dependOn(&b.addRunArtifact(cmd_test).step);
-        test_step.dependOn(&b.addRunArtifact(cmd_test).step);
+        test_step.dependOn(cov.run(cmd_test, "compress_cmd"));
     }
 
     // R4b stage 1 lib-helper test roots. Each is its own test artifact (a test
@@ -492,7 +507,7 @@ pub fn build(b: *std.Build) void {
         t.root_module.addOptions("build_options", opts);
         if (root.needs_common) t.root_module.addImport("common.zig", claw_common);
         if (root.needs_openclaw) t.root_module.addImport("openclaw.zig", claw_openclaw);
-        test_step.dependOn(&b.addRunArtifact(t).step);
+        test_step.dependOn(cov.run(t, root.name));
     }
 
     // caveman-claw — a tiny aggregate test binary that re-exports the three lib
@@ -547,7 +562,7 @@ pub fn build(b: *std.Build) void {
 
         const run_claw_step = b.step("test-claw", "Run the caveman-claw lib-helper tests");
         run_claw_step.dependOn(&b.addRunArtifact(claw_test).step);
-        test_step.dependOn(&b.addRunArtifact(claw_test).step);
+        test_step.dependOn(cov.run(claw_test, "claw"));
     }
 
     // R4b stage 2 — installer test root. install.zig imports the lib modules by
@@ -607,9 +622,48 @@ pub fn build(b: *std.Build) void {
         install_test.root_module.addImport("openclaw.zig", inst_openclaw);
         install_test.root_module.addImport("nullclaw.zig", inst_nullclaw);
         install_test.root_module.addImport("opencode_agent.zig", inst_opencode_agent);
-        test_step.dependOn(&b.addRunArtifact(install_test).step);
+        test_step.dependOn(cov.run(install_test, "install"));
     }
 }
+
+// ── Coverage helper ──────────────────────────────────────────────────────────
+//
+// Wraps a test artifact so `zig build test -Dtest-coverage` runs it under kcov.
+// kcov must be on PATH (provisioned by ../flake.nix devShell or the CI runner);
+// when it is absent the kcov command fails loudly with a clear message rather
+// than silently producing no coverage. With coverage OFF, covRun is a plain
+// RunArtifact — zero behavior change for the normal `zig build test`.
+const CoverageCtx = struct {
+    b: *std.Build,
+    enabled: bool,
+    merge: ?*std.Build.Step, // the `coverage-merge` step (only when enabled)
+
+    // Lines/patterns kcov must treat as non-executable so they never count as
+    // uncovered: Zig's unreachable / @panic / @compileError and the inline test
+    // blocks themselves. kcov has no Zig awareness, so we exclude by pattern.
+    const exclude_patterns = "unreachable,@panic,@compileError,SkipZigTest,error.SkipZigTest";
+
+    // Returns the build.Step the caller should `dependOn` for this test artifact.
+    fn run(self: CoverageCtx, t: *std.Build.Step.Compile, name: []const u8) *std.Build.Step {
+        const b = self.b;
+        if (!self.enabled) return &b.addRunArtifact(t).step;
+
+        // kcov OUT_DIR TEST_BIN — instrument only our src/, drop the excludes.
+        const out = b.fmt("{s}/coverage/{s}", .{ b.install_path, name });
+        const kcov = b.addSystemCommand(&.{
+            "kcov",
+            "--clean",
+            "--include-pattern=/src/",
+            b.fmt("--exclude-pattern={s}", .{exclude_patterns}),
+        });
+        kcov.addArg(out);
+        kcov.addArtifactArg(t); // the emitted test binary becomes argv after OUT_DIR
+        // kcov returns the wrapped program's exit code, so a failing test still
+        // fails the build. Merge step aggregates every per-binary report.
+        if (self.merge) |m| m.dependOn(&kcov.step);
+        return &kcov.step;
+    }
+};
 
 // Wire the two cross-package source-of-truth files init.zig embeds. The rule
 // body lives at src/rules/caveman-activate.md and the skill body at

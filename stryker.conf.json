@@ -1,0 +1,31 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "_comment": "JS mutation testing for the caveman oracle surface. Run via bunx (bun-only policy): `bunx stryker run`. JS is retiring (R6b) so the global gate is NON-BLOCKING (report-only). The surviving opencode plugin shim is the exception — CI runs Stryker scoped to src/plugins/opencode/** with a real threshold.",
+  "testRunner": "command",
+  "commandRunner": {
+    "command": "node --test tests/installer/*.test.mjs"
+  },
+  "mutate": [
+    "bin/lib/**/*.js",
+    "src/hooks/**/*.js",
+    "src/mcp-servers/**/*.js",
+    "src/plugins/opencode/**/*.js",
+    "!**/*.test.*"
+  ],
+  "ignorePatterns": [
+    ".jj",
+    ".git",
+    ".pixi",
+    "zig/.zig-cache",
+    "zig/zig-out",
+    "coverage",
+    ".stryker-tmp",
+    "node_modules"
+  ],
+  "_ignore_note": "This repo is colocated git+jj (Jujutsu). Stryker's sandbox copy chokes on the .jj socket files (ENOTSUP copyfile) — ignore .jj/.git and the build/cache dirs so the sandbox stays small and copyable.",
+  "coverageAnalysis": "off",
+  "reporters": ["clear-text", "html"],
+  "htmlReporter": { "fileName": "coverage/js-mutation/index.html" },
+  "thresholds": { "high": 90, "low": 80, "break": null },
+  "_thresholds_note": "break=null → Stryker never fails the build globally (JS retiring). CI overrides break for the opencode-shim-scoped run."
+}
